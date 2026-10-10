@@ -83,7 +83,7 @@ async function openJob(id) {
 }
 function renderJob(job) {
   text('job-title', job.name ? 'Letter for ' + job.name : 'Letter details');
-  text('job-meta', job.state + ' · ' + job.id.slice(0, 8) + ' · created ' + time(job.created) + ' · updated ' + time(job.updated));
+  text('job-meta', job.state + (job.ip ? ' · IP ' + job.ip : '') + ' · ' + job.id.slice(0, 8) + ' · created ' + time(job.created) + ' · updated ' + time(job.updated));
   text('job-message', job.message); text('job-reply', job.reply || 'No reply yet.');
   text('detail-error', job.error || ''); $('detail-error').hidden = !job.error;
   text('job-parent', job.parent ? 'Linked job: ' + job.parent : '');
@@ -131,6 +131,7 @@ const fields = [
   ['webhook_url', 'Code webhook URL', 'url'], ['font_size', 'Receipt font size (points)', 'number', 8, 18],
   ['visitor_title', 'Visitor heading', 'text'], ['visitor_intro', 'Visitor introduction', 'textarea'],
   ['browser_cooldown', 'Per-browser cooldown (seconds)', 'number', 0, 3600], ['global_per_minute', 'Letters per minute, globally', 'number', 1, 1000],
+  ['ip_per_minute', 'Default submissions per IP / minute', 'number', 1, 1000], ['ip_per_day', 'Default submissions per IP / 24 hours', 'number', 1, 10000],
   ['queue_limit', 'Maximum outstanding jobs', 'number', 1, 500], ['failed_codes_per_ip', 'Failed codes per IP / five minutes', 'number', 1, 100],
   ['retention_hours', 'Letter retention (hours)', 'number', 1, 168], ['cut', 'Cut paper after each receipt', 'checkbox']
 ];
@@ -209,6 +210,7 @@ async function refresh() {
   try {
     renderOverview(await api('overview'));
     if (currentTab === 'queue') await loadJobs();
+    if (currentTab === 'ip') await loadIPs();
     await loadHistory();
     if ($('job-dialog').open && selectedJob && !$('confirm-dialog').open) {
       const updated = await api('jobs/' + selectedJob.id);
@@ -218,3 +220,50 @@ async function refresh() {
   finally { loading = false; }
 }
 refresh(); setInterval(refresh, 5000); setInterval(updateCountdowns, 1000);
+
+function editIP(row) {
+  $('ip-address').value = row.ip; $('ip-minute').value = row.per_minute ?? '';
+  $('ip-day').value = row.per_day ?? ''; $('ip-note').value = row.note || '';
+  $('ip-blocked').checked = row.blocked; text('ip-rule-title', 'Edit rule for ' + row.ip);
+  $('ip-address').focus();
+}
+async function loadIPs() {
+  const data = await api('ip-controls');
+  if (!$('ip-default-minute').value) $('ip-default-minute').value = data.defaults.per_minute;
+  if (!$('ip-default-day').value) $('ip-default-day').value = data.defaults.per_day;
+  $('ip-rows').replaceChildren(); $('ip-empty').hidden = !!data.addresses.length;
+  for (const row of data.addresses) {
+    const tr = document.createElement('tr');
+    for (const value of [row.ip, `${row.minute_count || 0} / ${row.day_count || 0}`, `${row.effective_minute} / ${row.effective_day}`, (row.blocked ? 'Blocked' : row.has_rule ? 'Custom rule' : 'Default') + (row.note ? ' · ' + row.note : '')]) {
+      const td = document.createElement('td'); td.textContent = value; tr.append(td);
+    }
+    const td = document.createElement('td'), actions = document.createElement('div'); actions.className = 'actions';
+    function button(label, action) { const b = document.createElement('button'); b.textContent = label; b.type = 'button'; b.onclick = async () => { b.disabled = true; try { await action(); } catch (error) { notice(error.message, true); } finally { b.disabled = false; } }; actions.append(b); }
+    button('Edit', () => editIP(row));
+    button(row.blocked ? 'Unblock' : 'Block', async () => {
+      if (!await confirmAction(row.blocked ? 'Unblock IP?' : 'Block IP?', `${row.ip}: ${row.blocked ? 'allow submissions within its limits' : 'prevent new letter submissions across all browsers using this IP'}.`)) return;
+      await api('ip-controls', 'PUT', { ip: row.ip, blocked: !row.blocked, per_minute: row.per_minute, per_day: row.per_day, note: row.note });
+      await loadIPs(); notice('IP rule updated.');
+    });
+    if (row.has_rule) button('Use defaults', async () => {
+      if (!await confirmAction('Restore default limits?', 'Remove the saved rule and any block for ' + row.ip + '. Recent usage counts are kept.')) return;
+      await api('ip-controls/remove', 'POST', { ip: row.ip }); await loadIPs(); notice('IP uses the default limits.');
+    });
+    td.append(actions); tr.append(td); $('ip-rows').append(tr);
+  }
+}
+$('ip-reset').onclick = () => { $('ip-rule-form').reset(); text('ip-rule-title', 'Block or customise an IP'); };
+$('ip-defaults-form').onsubmit = async event => {
+  event.preventDefault(); event.submitter.disabled = true;
+  try { await api('settings', 'PATCH', { ip_per_minute: Number($('ip-default-minute').value), ip_per_day: Number($('ip-default-day').value) }); await loadIPs(); notice('Default IP limits saved.'); }
+  catch (error) { notice(error.message, true); } finally { event.submitter.disabled = false; }
+};
+$('ip-rule-form').onsubmit = async event => {
+  event.preventDefault(); event.submitter.disabled = true;
+  try {
+    await api('ip-controls', 'PUT', { ip: $('ip-address').value.trim(), blocked: $('ip-blocked').checked,
+      per_minute: $('ip-minute').value ? Number($('ip-minute').value) : null,
+      per_day: $('ip-day').value ? Number($('ip-day').value) : null, note: $('ip-note').value.trim() });
+    await loadIPs(); notice('IP rule saved.');
+  } catch (error) { notice(error.message, true); } finally { event.submitter.disabled = false; }
+};

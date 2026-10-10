@@ -27,7 +27,9 @@ class Clock:
 
 @pytest.fixture
 def db(tmp_path):
-    return Store(tmp_path, Clock())
+    store = Store(tmp_path, Clock())
+    store.update_settings({'ip_per_minute': 1000, 'ip_per_day': 10000}, 'test setup')
+    return store
 
 
 def submit(db, owner='visitor', idem='abcdefghijklmnop', code=None, message='I wish for a telescope.'):
@@ -539,3 +541,118 @@ def test_live_signed_token_gate_at_http_layer(db, signed_access, monkeypatch):
 
 def test_normalized_whitespace_cannot_bypass_length_limit(client, db):
     assert post_letter(client, db, message='a' + '\t' * 500 + 'b').status_code == 422
+
+
+def test_ip_defaults_and_minute_boundary(tmp_path):
+    db = Store(tmp_path, Clock())
+    assert db.settings()['ip_per_minute'] == 5
+    assert db.settings()['ip_per_day'] == 10
+    db.update_settings({'browser_cooldown': 0}, 'admin')
+    for n in range(5):
+        submit(db, owner=str(n))
+    with pytest.raises(Rejected, match='per-minute') as error:
+        submit(db, owner='sixth')
+    assert error.value.status == 429
+    assert db.metrics() == {'waiting': 5}
+    db.clock.value += 60
+    assert submit(db, owner='sixth')
+
+
+def test_ip_daily_window_survives_purge_and_restart(db):
+    db.update_settings({'ip_per_day': 2, 'retention_hours': 1}, 'admin')
+    first = submit(db, owner='one')
+    db.transition(first['id'], 'waiting', 'failed')
+    db.clock.value += 61
+    second = submit(db, owner='two')
+    db.transition(second['id'], 'waiting', 'failed')
+    db.clock.value += 3601
+    db.cleanup()
+    assert db.metrics() == {}
+    again = Store(db.directory, db.clock)
+    with pytest.raises(Rejected, match='daily limit'):
+        submit(again, owner='three')
+    db.clock.value = 30000 + 86400
+    assert submit(again, owner='three')
+
+
+def test_wrong_code_counts_but_idempotent_retry_does_not(db):
+    db.update_settings({'ip_per_minute': 2}, 'admin')
+    code = db.codes()['current']['code']
+    bad = '9999' if code != '9999' else '9998'
+    with pytest.raises(Rejected, match='incorrect'):
+        submit(db, owner='bad', code=bad)
+    job = submit(db)
+    assert submit(db)['id'] == job['id']
+    assert db.ip_controls()['addresses'][0]['minute_count'] == 2
+    with pytest.raises(Rejected, match='per-minute'):
+        submit(db, owner='third')
+
+
+def test_ip_override_block_unblock_and_canonical_ipv6(db):
+    db.update_settings({'ip_per_minute': 1}, 'admin')
+    db.set_ip_rule('::ffff:1.2.3.4', False, 2, 20, 'Custom visitor', 'admin')
+    submit(db, owner='one')
+    job = submit(db, owner='two')
+    assert job['ip'] == '1.2.3.4'
+    with pytest.raises(Rejected, match='per-minute'):
+        submit(db, owner='three')
+    db.set_ip_rule('1.2.3.4', True, 2, 20, '', 'admin')
+    with pytest.raises(Rejected) as error:
+        submit(db, owner='two')  # blocks even accepted-request replays
+    assert error.value.status == 403
+    db.delete_ip_rule('1.2.3.4', 'admin')
+    assert submit(db, owner='two')['id'] == job['id']
+    assert db.ip_controls()['addresses'][0]['effective_minute'] == 1
+    assert Store.canonical_ip('2001:0db8::1') == '2001:db8::1'
+
+
+def test_ip_limit_atomic_across_browsers(db):
+    db.update_settings({'ip_per_minute': 5, 'global_per_minute': 100}, 'admin')
+    code = db.codes()['current']['code']
+    def attempt(n):
+        try:
+            return submit(db, owner=str(n), code=code)['id']
+        except Rejected:
+            return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(attempt, range(15)))
+    assert len([r for r in results if r]) == 5
+
+
+def test_ip_rule_validation_auth_and_actions(client, db):
+    assert client.get('/admin/api/ip-controls').status_code == 401
+    assert client.put('/admin/api/ip-controls', json={'ip': '1.2.3.4', 'blocked': True}, headers=headers()).status_code == 401
+    for body in ({'ip': 'bad'}, {'ip': '1.2.3.4', 'per_day': 0}, {'ip': '1.2.3.4', 'blocked': 'yes'}):
+        assert client.put('/admin/api/ip-controls', json=body, headers=headers(True)).status_code == 422
+    body = {'ip': '127.0.0.1', 'blocked': True, 'note': 'Test block'}
+    assert client.put('/admin/api/ip-controls', json=body, headers=headers(True)).status_code == 200
+    assert post_letter(client, db).status_code == 403
+    assert db.metrics() == {}
+    assert client.post('/admin/api/ip-controls/remove', json={'ip': '127.0.0.1'}, headers=headers(True)).status_code == 200
+    assert post_letter(client, db).status_code == 202
+    assert db.history('audit')[0]['action'] == 'remove IP rule'
+
+
+def test_trusted_cloudflare_ip_and_spoofed_forwarding(db, monkeypatch):
+    monkeypatch.delenv('PUBLIC_ORIGIN', raising=False)
+    monkeypatch.setenv('TRUST_CLOUDFLARE_HEADERS', 'true')
+    with TestClient(create_app(db, start_background=False)) as client:
+        body = dict(name='', message='A wish', code=db.codes()['current']['code'], idempotency_key='abcdefghijklmnop')
+        reply = client.post('/api/letters', json=body, headers={**headers(), 'CF-Connecting-IP': '203.0.113.9'})
+        assert db.get_job(reply.json()['id'])['ip'] == '203.0.113.9'
+    monkeypatch.setenv('TRUST_CLOUDFLARE_HEADERS', 'false')
+    with TestClient(create_app(db, start_background=False)) as client:
+        reply = client.post('/api/letters', json=body, headers={**headers(), 'CF-Connecting-IP': '203.0.113.99', 'X-Forwarded-For': '203.0.113.99'})
+        assert db.get_job(reply.json()['id'])['ip'] == '127.0.0.1'
+
+
+def test_legacy_database_upgrade(tmp_path):
+    import sqlite3
+    with sqlite3.connect(tmp_path / 'santa.sqlite3') as connection:
+        connection.execute('CREATE TABLE jobs(id TEXT PRIMARY KEY,owner TEXT,idem TEXT,fingerprint TEXT,name TEXT,message TEXT,state TEXT,reply TEXT,error TEXT,created REAL,updated REAL,parent TEXT,config TEXT)')
+        connection.execute('CREATE TABLE settings(id INTEGER PRIMARY KEY,value TEXT)')
+        connection.execute('INSERT INTO settings VALUES(1,?)', (json.dumps({'visitor_intro': 'Custom greeting'}),))
+    db = Store(tmp_path, Clock())
+    assert db.settings()['visitor_intro'] == 'Custom greeting'
+    assert submit(db)['ip'] == '1.2.3.4'
+    assert db.settings()['ip_per_day'] == 10

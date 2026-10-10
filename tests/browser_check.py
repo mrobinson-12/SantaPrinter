@@ -68,6 +68,7 @@ def main():
                     page.set_viewport_size({'width': width, 'height': 900})
                     page.goto(base)
                     expect(page.locator('#title')).to_contain_text('Christmas magic')
+                    expect(page.get_by_role('img', name='Lights on Elizabeth', exact=True)).to_be_visible()
                     assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), width
                     for selector in ('#name', '#message', '#code', '#submit'):
                         assert page.locator(selector).bounding_box()['height'] >= 44
@@ -169,6 +170,33 @@ def main():
                 admin.locator('#pause-printing').click()
                 expect(admin.locator('#pause-printing')).to_have_text('Pause printing')
                 assert not db.settings()['paused_printing']
+                admin.locator('#tab-ip').click()
+                expect(admin.locator('#ip-default-minute')).to_have_value('5')
+                expect(admin.locator('#ip-default-day')).to_have_value('10')
+                admin.locator('#ip-default-minute').fill('4')
+                admin.locator('#ip-defaults-form button').click()
+                expect(admin.locator('#admin-status')).to_have_text('Default IP limits saved.')
+                assert db.settings()['ip_per_minute'] == 4
+                admin.locator('#ip-address').fill('127.0.0.1')
+                admin.locator('#ip-minute').fill('2')
+                admin.locator('#ip-day').fill('12')
+                admin.locator('#ip-note').fill('Browser test')
+                admin.locator('#ip-blocked').check()
+                admin.locator('#ip-rule-form button[type=submit]').click()
+                expect(admin.locator('#ip-rows')).to_contain_text('Blocked · Browser test')
+                page.reload()
+                page.locator('#message').fill('A new Christmas wish.')
+                page.locator('#code').fill(db.codes()['current']['code'])
+                page.locator('#submit').click()
+                expect(page.locator('#form-error')).to_contain_text('blocked')
+                admin.get_by_role('button', name='Unblock', exact=True).click()
+                admin.locator('#confirm-yes').click()
+                expect(admin.locator('#ip-rows')).to_contain_text('Custom rule · Browser test')
+                admin.get_by_role('button', name='Use defaults', exact=True).click()
+                admin.locator('#confirm-yes').click()
+                expect(admin.locator('#ip-rows')).to_contain_text('Default')
+                assert db.ip_controls()['addresses'][0]['effective_minute'] == 4
+                admin.screenshot(path=str(screenshots / 'admin-ip-controls.png'), full_page=True)
                 assert deliveries and set(deliveries[0]) == {'code'}
                 assert errors == [], errors
                 print('Browser acceptance passed: mobile/desktop layouts, draft recovery, code gate, ownership, automatic printing, admin controls, exact reprint, diagnostics, and uncertain-send review.')

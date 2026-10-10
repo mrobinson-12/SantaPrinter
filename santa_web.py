@@ -64,6 +64,8 @@ class Settings(BaseModel):
     global_per_minute: int | None = Field(default=None, ge=1, le=1000)
     queue_limit: int | None = Field(default=None, ge=1, le=500)
     failed_codes_per_ip: int | None = Field(default=None, ge=1, le=100)
+    ip_per_minute: int | None = Field(default=None, ge=1, le=1000)
+    ip_per_day: int | None = Field(default=None, ge=1, le=10000)
     retention_hours: int | None = Field(default=None, ge=1, le=168)
 
     @field_validator('printer_host')
@@ -86,6 +88,28 @@ class Settings(BaseModel):
         if parts.scheme not in ('http', 'https') or not parts.hostname or parts.username or parts.password or parts.fragment:
             raise ValueError('Use an HTTP(S) URL without credentials or a fragment.')
         return value
+
+
+class IPRule(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    ip: str = Field(min_length=1, max_length=45)
+    blocked: bool = False
+    per_minute: int | None = Field(default=None, ge=1, le=1000)
+    per_day: int | None = Field(default=None, ge=1, le=10000)
+    note: str = Field(default='', max_length=200)
+
+    @field_validator('ip')
+    @classmethod
+    def address(cls, value):
+        try:
+            return Store.canonical_ip(value)
+        except Rejected as error:
+            raise ValueError(error.message) from None
+
+
+class IPDelete(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    ip: str = Field(min_length=1, max_length=45)
 
 
 class Preview(BaseModel):
@@ -235,7 +259,9 @@ def create_app(store=None, service=None, verifier=None, start_background=True):
         return {key: cfg[key] for key in ('visitor_title', 'visitor_intro', 'paused_submissions')}
 
     def client_ip(request):
-        peer = request.client.host if request.client else 'unknown'
+        peer = request.client.host if request.client else '127.0.0.1'
+        if peer == 'testclient':
+            peer = '127.0.0.1'
         if peer in ('127.0.0.1', '::1', 'testclient') and os.getenv('TRUST_CLOUDFLARE_HEADERS', '').lower() == 'true':
             try:
                 return str(ipaddress.ip_address(request.headers.get('CF-Connecting-IP', '')))
@@ -304,6 +330,22 @@ def create_app(store=None, service=None, verifier=None, start_background=True):
     def resend(request: Request):
         request.app.state.store.resend(request.state.actor)
         return {'ok': True}
+
+    @app.get('/admin/api/ip-controls')
+    def ip_controls(request: Request):
+        return request.app.state.store.ip_controls()
+
+    @app.put('/admin/api/ip-controls')
+    def set_ip_rule(body: IPRule, request: Request):
+        db = request.app.state.store
+        db.set_ip_rule(body.ip, body.blocked, body.per_minute, body.per_day, body.note, request.state.actor)
+        return db.ip_controls()
+
+    @app.post('/admin/api/ip-controls/remove')
+    def remove_ip_rule(body: IPDelete, request: Request):
+        db = request.app.state.store
+        db.delete_ip_rule(body.ip, request.state.actor)
+        return db.ip_controls()
 
     @app.get('/admin/api/deliveries')
     def deliveries(request: Request):

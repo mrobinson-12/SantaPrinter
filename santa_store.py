@@ -1,6 +1,7 @@
 """Transactional state for the web app. No network or printer side effects here."""
 from contextlib import contextmanager
 import hashlib
+import ipaddress
 import json
 from pathlib import Path
 import secrets
@@ -11,10 +12,11 @@ import uuid
 DEFAULTS = dict(printer_host='192.168.1.100', printer_port=9100,
                 webhook_url='http://192.168.1.103/code', font_size=12, cut=True,
                 visitor_title='A little letter. A lot of Christmas magic.',
-                visitor_intro='Tell Santa what is on your Christmas wish list. A personal letter will be waiting at the printer.',
+                visitor_intro='Make a Christmas wish at Lights on Elizabeth, then collect your personal Santa letter at the display.',
                 paused_submissions=False, paused_printing=False,
                 browser_cooldown=60, global_per_minute=10, queue_limit=50,
-                failed_codes_per_ip=10, retention_hours=24)
+                failed_codes_per_ip=10, retention_hours=24,
+                ip_per_minute=5, ip_per_day=10)
 ACTIVE = ('waiting', 'generating', 'ready', 'sending', 'uncertain')
 
 
@@ -49,9 +51,22 @@ class Store:
             CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, created);
             CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner, created);
             CREATE TABLE IF NOT EXISTS bad_codes (ip TEXT NOT NULL, at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS ip_attempts (ip TEXT NOT NULL, at REAL NOT NULL);
+            CREATE INDEX IF NOT EXISTS ip_attempts_window ON ip_attempts(ip,at);
+            CREATE TABLE IF NOT EXISTS ip_rules (ip TEXT PRIMARY KEY, blocked INTEGER NOT NULL,
+                per_minute INTEGER, per_day INTEGER, note TEXT NOT NULL, updated REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, at REAL NOT NULL,
                 actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);
             ''')
+            if 'ip' not in {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}:
+                db.execute('ALTER TABLE jobs ADD COLUMN ip TEXT')
+            # Upgrade the old default copy while preserving personalised event text.
+            existing = db.execute('SELECT value FROM settings WHERE id=1').fetchone()
+            if existing:
+                cfg = json.loads(existing[0])
+                if cfg.get('visitor_intro') == 'Tell Santa what is on your Christmas wish list. A personal letter will be waiting at the printer.':
+                    cfg['visitor_intro'] = DEFAULTS['visitor_intro']
+                    db.execute('UPDATE settings SET value=? WHERE id=1', (json.dumps(cfg),))
             db.execute('INSERT OR IGNORE INTO settings VALUES (1, ?)', (json.dumps(DEFAULTS),))
 
     @contextmanager
@@ -155,47 +170,110 @@ class Store:
             db.execute('UPDATE codes SET delivered=0, attempts=0, next_attempt=0 WHERE slot=?', (slot,))
             self.audit_in(db, actor, 'resend code', str(slot))
 
-    def submit(self, owner, ip, idem, name, message, code):
-        fingerprint = hashlib.sha256(json.dumps([name, message], ensure_ascii=False).encode()).hexdigest()
-        rejection = None
-        job = None
+    @staticmethod
+    def canonical_ip(value):
+        try:
+            if '%' in value:
+                raise ValueError('Scoped IP addresses are not supported.')
+            address = ipaddress.ip_address(value.strip())
+            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+                address = address.ipv4_mapped
+            return str(address)
+        except ValueError:
+            raise Rejected('Enter a valid IPv4 or IPv6 address.') from None
+
+    def set_ip_rule(self, ip, blocked, per_minute, per_day, note, actor):
+        ip = self.canonical_ip(ip)
         with self.transaction() as db:
-            now = self.clock()
+            db.execute('INSERT INTO ip_rules VALUES (?,?,?,?,?,?) ON CONFLICT(ip) DO UPDATE SET '
+                       'blocked=excluded.blocked,per_minute=excluded.per_minute,per_day=excluded.per_day,'
+                       'note=excluded.note,updated=excluded.updated',
+                       (ip, int(blocked), per_minute, per_day, note, self.clock()))
+            self.audit_in(db, actor, 'IP rule', json.dumps(dict(ip=ip, blocked=blocked,
+                          per_minute=per_minute, per_day=per_day, note=note)))
+        return ip
+
+    def delete_ip_rule(self, ip, actor):
+        ip = self.canonical_ip(ip)
+        with self.transaction() as db:
+            db.execute('DELETE FROM ip_rules WHERE ip=?', (ip,))
+            self.audit_in(db, actor, 'remove IP rule', ip)
+
+    def ip_controls(self):
+        with self.connect() as db:
+            now, cfg = self.clock(), self.settings_in(db)
+            rules = {r['ip']: dict(r) for r in db.execute('SELECT * FROM ip_rules')}
+            activity = {r['ip']: dict(r) for r in db.execute(
+                'SELECT ip,MAX(at) last_seen,SUM(at>?) minute_count,COUNT(*) day_count '
+                'FROM ip_attempts WHERE at>? GROUP BY ip', (now - 60, now - 86400))}
+            rows = []
+            for ip in rules.keys() | activity.keys():
+                rule = rules.get(ip, {})
+                rows.append(dict(ip=ip, blocked=bool(rule.get('blocked')), has_rule=ip in rules,
+                                 per_minute=rule.get('per_minute'), per_day=rule.get('per_day'),
+                                 effective_minute=rule.get('per_minute') if rule.get('per_minute') is not None else cfg['ip_per_minute'],
+                                 effective_day=rule.get('per_day') if rule.get('per_day') is not None else cfg['ip_per_day'],
+                                 note=rule.get('note', ''), **{k: v for k, v in activity.get(ip, {}).items() if k != 'ip'}))
+            rows.sort(key=lambda r: (not r['blocked'], not r['has_rule'], -(r.get('last_seen') or 0), r['ip']))
+            return dict(defaults=dict(per_minute=cfg['ip_per_minute'], per_day=cfg['ip_per_day']), addresses=rows)
+
+    def submit(self, owner, ip, idem, name, message, code):
+        ip = self.canonical_ip(ip)
+        fingerprint = hashlib.sha256(json.dumps([name, message], ensure_ascii=False).encode()).hexdigest()
+        rejection, job = None, None
+        with self.transaction() as db:
+            now, cfg = self.clock(), self.settings_in(db)
+            rule = db.execute('SELECT * FROM ip_rules WHERE ip=?', (ip,)).fetchone()
+            if rule and rule['blocked']:
+                raise Rejected('Submissions from this IP address are blocked. Please ask the event team.', 403)
             existing = db.execute('SELECT * FROM jobs WHERE owner=? AND idem=?', (owner, idem)).fetchone()
             if existing:
                 if existing['fingerprint'] != fingerprint:
                     raise Rejected('This submission identifier was already used for a different letter.', 409)
                 return dict(existing)
-            cfg = self.settings_in(db)
             if cfg['paused_submissions']:
                 raise Rejected('Santa is taking a short break. Please try again soon.', 503)
-            db.execute('DELETE FROM bad_codes WHERE at<=?', (now - 300,))
-            failures = db.execute('SELECT COUNT(*) FROM bad_codes WHERE ip=?', (ip,)).fetchone()[0]
-            if failures >= cfg['failed_codes_per_ip']:
-                raise Rejected('Too many code attempts. Please wait five minutes.', 429)
-            slot = self.rotate_in(db, now)
-            valid = slot is not None and any(secrets.compare_digest(code, row['code']) for row in
-                    db.execute('SELECT code FROM codes WHERE slot IN (?,?)', (slot, slot - 1)))
-            if not valid:
-                # Commit the failure before returning an error, rather than rolling it back.
-                db.execute('INSERT INTO bad_codes VALUES (?,?)', (ip, now))
-                rejection = Rejected('That code is incorrect or expired. Check the code shown at the event.')
-            else:
-                last = db.execute('SELECT MAX(created) FROM jobs WHERE owner=? AND parent IS NULL', (owner,)).fetchone()[0]
-                if last is not None and now - last < cfg['browser_cooldown']:
-                    raise Rejected('Please wait a moment before sending another letter.', 429)
-                total = db.execute('SELECT COUNT(*) FROM jobs WHERE created>? AND parent IS NULL', (now - 60,)).fetchone()[0]
-                if total >= cfg['global_per_minute']:
-                    raise Rejected('Santa has lots of letters right now. Please try again in a minute.', 429)
-                self.capacity_in(db, cfg)
-                job_id = uuid.uuid4().hex
-                db.execute('INSERT INTO jobs(id,owner,idem,fingerprint,name,message,state,created,updated,config) '
-                           'VALUES (?,?,?,?,?,?,\'waiting\',?,?,?)',
-                           (job_id, owner, idem, fingerprint, name, message, now, now, json.dumps(cfg)))
-                job = dict(db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone())
+            minute_limit = rule['per_minute'] if rule and rule['per_minute'] is not None else cfg['ip_per_minute']
+            day_limit = rule['per_day'] if rule and rule['per_day'] is not None else cfg['ip_per_day']
+            counts = db.execute('SELECT SUM(at>?) minute_count,COUNT(*) day_count FROM ip_attempts '
+                                'WHERE ip=? AND at>?', (now - 60, ip, now - 86400)).fetchone()
+            if (counts['minute_count'] or 0) >= minute_limit:
+                raise Rejected('This IP has reached its per-minute limit. Please wait a minute.', 429)
+            if counts['day_count'] >= day_limit:
+                raise Rejected('This IP has reached its daily limit. Please try again later or ask the event team.', 429)
+            db.execute('INSERT INTO ip_attempts VALUES (?,?)', (ip, now))
+            try:
+                job = self.enqueue_in(db, cfg, now, owner, ip, idem, fingerprint, name, message, code)
+            except Rejected as error:
+                # Failed codes/cooldowns also consume an admitted attempt. Commit before returning an error.
+                rejection = error
         if rejection:
             raise rejection
         return job
+
+    def enqueue_in(self, db, cfg, now, owner, ip, idem, fingerprint, name, message, code):
+        db.execute('DELETE FROM bad_codes WHERE at<=?', (now - 300,))
+        failures = db.execute('SELECT COUNT(*) FROM bad_codes WHERE ip=?', (ip,)).fetchone()[0]
+        if failures >= cfg['failed_codes_per_ip']:
+            raise Rejected('Too many code attempts. Please wait five minutes.', 429)
+        slot = self.rotate_in(db, now)
+        valid = slot is not None and any(secrets.compare_digest(code, row['code']) for row in
+                db.execute('SELECT code FROM codes WHERE slot IN (?,?)', (slot, slot - 1)))
+        if not valid:
+            db.execute('INSERT INTO bad_codes VALUES (?,?)', (ip, now))
+            raise Rejected('That code is incorrect or expired. Check the code shown at the event.')
+        last = db.execute('SELECT MAX(created) FROM jobs WHERE owner=? AND parent IS NULL', (owner,)).fetchone()[0]
+        if last is not None and now - last < cfg['browser_cooldown']:
+            raise Rejected('Please wait a moment before sending another letter.', 429)
+        total = db.execute('SELECT COUNT(*) FROM jobs WHERE created>? AND parent IS NULL', (now - 60,)).fetchone()[0]
+        if total >= cfg['global_per_minute']:
+            raise Rejected('Santa has lots of letters right now. Please try again in a minute.', 429)
+        self.capacity_in(db, cfg)
+        job_id = uuid.uuid4().hex
+        db.execute('INSERT INTO jobs(id,owner,idem,fingerprint,name,message,state,created,updated,config,ip) '
+                   "VALUES (?,?,?,?,?,?,'waiting',?,?,?,?)",
+                   (job_id, owner, idem, fingerprint, name, message, now, now, json.dumps(cfg), ip))
+        return dict(db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone())
 
     @staticmethod
     def capacity_in(db, cfg):
@@ -319,6 +397,7 @@ class Store:
             # Diagnostics contain no letter content, but still have a finite retention.
             db.execute('DELETE FROM deliveries WHERE at<?', (self.clock() - 7 * 86400,))
             db.execute('DELETE FROM audit WHERE at<?', (self.clock() - 7 * 86400,))
+            db.execute('DELETE FROM ip_attempts WHERE at<=?', (self.clock() - 86400,))
             db.execute('DELETE FROM bad_codes WHERE at<?', (self.clock() - 300,))
             db.execute('DELETE FROM codes WHERE slot<? AND slot NOT IN (SELECT slot FROM codes ORDER BY slot DESC LIMIT 2)',
                        (int(self.clock() // 300) - 3,))

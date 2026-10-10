@@ -88,3 +88,23 @@ Before opening the event, confirm the current code is delivered in `/admin`, run
 ## Data and backup
 
 `SANTA_DATA_DIR` defaults to `runtime/` and contains SQLite, WAL files, receipt artifacts, and the singleton process lock. Restrict access to this directory. To take a consistent simple backup, stop the server and copy the whole directory; restart afterwards. Never expose this directory through your web server. Keep the original border file and a supported font available on the server.
+
+
+## Lights on Elizabeth branding and IP controls
+
+The supplied Lights on Elizabeth logo appears on the visitor and event-team pages. Existing installations automatically get the new display introduction only if they still use the original default text; custom introductions are preserved.
+
+In `/admin`, open **IP controls** to configure default per-IP submission limits (5 per minute and 10 per rolling 24 hours initially), inspect recent IP usage, or create an exact IPv4/IPv6 rule. Each rule can block submissions or override either limit independently; blank overrides inherit defaults. The rule can be edited, unblocked, or removed to restore defaults. Removing a rule does not clear recent usage. Saved rules persist until removed. All rule changes are recorded in the admin audit.
+
+Limits apply to new visitor letter submission attempts with valid form fields, including incorrect codes and rejected cooldown/queue attempts. Replays of an accepted idempotent submission do not consume quota; blocked IPs cannot replay submission requests. Pages, status polls, existing letter retrieval, diagnostics, and admin actions do not consume visitor quota. Rate-limited and blocked requests enqueue no work and make no AI/printer calls. Usage survives restarts and letter purging, expires after 24 hours, and is kept separately from receipt retention. Historical jobs created before this upgrade have no recorded IP.
+
+`TRUST_CLOUDFLARE_HEADERS=true` must be set when the origin is bound to loopback and cloudflared is the trusted proxy. Otherwise visitors share the proxy's IP and quota. Only loopback connections can supply `CF-Connecting-IP`; `X-Forwarded-For` is ignored. IPv4-mapped IPv6 addresses are normalised to IPv4. Visitors sharing Wi-Fi/mobile carrier NAT may share an IP, so adjust limits for your event. Existing browser, global, queue, and failed-code limits still apply in addition to the new controls.
+
+The database upgrade is automatic and preserves jobs/settings. To deploy the committed update in the VM/LXC:
+
+```sh
+cd ~/SantaPrinter
+git pull --ff-only
+.venv/bin/python -m pip install -r requirements.txt
+sudo systemctl restart santa-printer
+```
