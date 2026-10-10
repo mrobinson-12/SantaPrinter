@@ -1,6 +1,6 @@
 # Santa Printer event operations
 
-The app runs one shared runtime with two AI workers, one print worker, and independent code/monitor loops. The public listener stays at `127.0.0.1:8000`. The optional LAN listener uses HTTPS and its own owner password. AI requests no longer delay already prepared receipts.
+The app runs one shared runtime with two AI workers, one print worker, and independent code/monitor loops. The public listener stays at `127.0.0.1:8000`. AI requests no longer delay already prepared receipts.
 
 ## Update your existing Linux server
 
@@ -27,7 +27,7 @@ sudo systemctl status santa-printer --no-pager
 
 The last command should show **active (running)**. Open your normal website's `/admin` page, run the readiness checks under Diagnostics, and print one test letter to inspect it. If the block reports an error, stop and copy that error before trying additional commands.
 
-The core upgrade works with your existing configuration. **LAN login and Twilio SMS are optional setup steps below**, not requirements for starting the updated app. Do not copy `.env.example` over your real `.env`.
+The core upgrade works with your existing configuration. **Twilio SMS is an optional setup step below**, not requirements for starting the updated app. Do not copy `.env.example` over your real `.env`.
 
 Use Python 3.10 or later. Linux needs the timezone database (`tzdata`) and `logrotate` for schedules and rotated file logs. On Debian/Ubuntu, install missing packages with `sudo apt-get install tzdata logrotate`. Dependency pins reflect the verified development environment; pip also resolves interpreter-specific conditional dependencies.
 
@@ -55,18 +55,7 @@ For a fresh installation, configure `.env` and the virtual environment first. Re
 
 Startup creates an additional pre-migration snapshot in `santa-backups/` when upgrading an existing job schema. For rollback, stop the app and watchdog, restore the snapshot using the new `santa_tools.py`, check out the previous Git commit shown by `git reflog`, reinstall that commit's requirements, then start the old app service. Disable the new watchdog and backup timers until upgrading again. Restore also keeps a pre-restore safety snapshot outside runtime.
 
-## Configure local HTTPS administration
-
-On the Linux host, reserve a stable private IP. Generate certificate files:
-
-```sh
-.venv/bin/python deploy/configure-lan.py --host 192.168.1.20 --origin https://192.168.1.20:8443
-.venv/bin/python santa_tools.py reset-owner-password
-```
-
-Copy the printed LAN settings into `.env`. The default password file lives under `SANTA_DATA_DIR`; a blank `SANTA_OWNER_PASSWORD_FILE` uses this default. Trust the generated certificate on your owner devices, verify its SHA-256 fingerprint, and restart the app. A certificate issued by your existing trusted private CA can replace these files. Renew certificates before expiry.
-
-Only allow TCP 8443 from the management LAN using your host/router firewall. Do not forward it from the internet or add it to cloudflared. Bind to the host's specific private address, not `0.0.0.0`. Open the configured address and sign in; sessions expire after eight hours. Resetting the password invalidates all sessions immediately. The LAN listener serves administration only; its password and cookies cannot authenticate public routes. Cloudflare login remains required through the tunnel.
+Acknowledging an incident hides its card and suppresses reminders until the fault clears and occurs again. Acknowledgement does not release printer holds or resolve uncertain transmissions.
 
 ## Configure SMS
 
@@ -80,7 +69,7 @@ The independent watchdog checks `/healthz` every 30 seconds and drains the same 
 
 ## Before opening
 
-Run `.venv/bin/python santa_tools.py doctor` and the dashboard readiness checks. Resolve faults, verify the current code on the display, and inspect one physical test receipt. Use the explicit paid AI test if connectivity is unverified. Test the public login and the LAN address on your owner device. Confirm SMS test delivery, active schedule, free storage and paper supply.
+Run `.venv/bin/python santa_tools.py doctor` and the dashboard readiness checks. Resolve faults, verify the current code on the display, and inspect one physical test receipt. Use the explicit paid AI test if connectivity is unverified. Test the public login on your owner device. Confirm SMS test delivery, active schedule, free storage and paper supply.
 
 The admission target is ten letters per minute. Measure the real printer using a timed batch of diagnostic receipts, inspect all output, and reduce the global limit if it cannot keep up. Rendering, TCP delivery, and live sensors cannot prove physical receipt completion.
 
@@ -91,13 +80,13 @@ The admission target is ten letters per minute. Measure the real printer using a
 - **AI outage:** transient requests retry after 5 and 15 seconds. Prepared letters use only the validated name and fixed local template, never the visitor's wish. Disable fallback in Settings if you prefer manual retries. Saved replies are reused after rendering retries or restarts.
 - **Damaged receipt artifact:** retry rendering the saved reply. No print connection is made for an invalid file.
 - **Wrong printer address:** save the correct destination. All queued receipts use it; layout/bytes stay unchanged. No uncertain job is automatically resent.
-- **Public site/login unavailable:** use LAN administration. If the app itself is down, use SSH: `sudo systemctl status santa-printer`, inspect `runtime/service.log`, run `doctor`, then `sudo systemctl restart santa-printer` after correcting configuration. The restart limit prevents endless crash loops; use `sudo systemctl reset-failed santa-printer` after fixing a startup problem.
+- **Public site/login unavailable:** use SSH: `sudo systemctl status santa-printer`, inspect `runtime/service.log`, run `doctor`, then `sudo systemctl restart santa-printer` after correcting configuration. The restart limit prevents endless crash loops; use `sudo systemctl reset-failed santa-printer` after fixing a startup problem.
 
 Download the diagnostic bundle for sharing. It uses a strict allowlist and excludes credentials, codes, visitor messages/names, IPs and audit detail. Full runtime backups contain private data and must not be shared as diagnostics.
 
 ## Backup, restore and retention
 
-Manual backup/restore refuses while the app holds its process lock. Stop the watchdog as well before maintenance. Snapshot permissions are restricted; the database is a standalone consistent SQLite copy and receipt files are integrity checked against a manifest during restore. Snapshots include the default owner password hash and `runtime/lan-tls` certificates. `.env`, custom password files and custom TLS files outside these paths must be preserved separately.
+Manual backup/restore refuses while the app holds its process lock. Stop the watchdog as well before maintenance. Snapshot permissions are restricted; the database is a standalone consistent SQLite copy and receipt files are integrity checked against a manifest during restore. Preserve `.env` separately.
 
 ```sh
 .venv/bin/python santa_tools.py backup /secure/backups/event-snapshot
@@ -115,4 +104,4 @@ The daily job prunes snapshots after the configured letter-retention duration re
 .venv/bin/python tests/rehearse.py
 ```
 
-These checks use temporary databases and fake AI/printer/SMS services. The rehearsal accelerates three minutes at ten letters per minute; it does not measure real hardware speed. Before opening, rehearse paper-out, cover-open, disconnected printer, interrupted transmission, app restart, blocked AI connectivity, and Cloudflare failure with the deployed equipment. Verify no automatic duplicate receipt, preserved pending jobs, working fallback, correct LAN login, and fault/recovery SMS within scheduled hours.
+These checks use temporary databases and fake AI/printer/SMS services. The rehearsal accelerates three minutes at ten letters per minute; it does not measure real hardware speed. Before opening, rehearse paper-out, cover-open, disconnected printer, interrupted transmission, app restart, blocked AI connectivity, and Cloudflare failure with the deployed equipment. Verify no automatic duplicate receipt, preserved pending jobs, working fallback, correct Cloudflare login, and fault/recovery SMS within scheduled hours.

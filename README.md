@@ -51,4 +51,4 @@ A mobile visitor app and Cloudflare Access protected event-team panel are now in
 
 ## Event reliability and recovery
 
-See [OPERATIONS.md](OPERATIONS.md) for Linux deployment, LAN owner access, scheduled SMS alerts, safe queue recovery, backups/restore, and the event rehearsal.
+See [OPERATIONS.md](OPERATIONS.md) for Linux deployment, scheduled SMS alerts, safe queue recovery, backups/restore, and the event rehearsal.

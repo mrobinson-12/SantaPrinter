@@ -91,8 +91,6 @@ class Store:
                 created REAL NOT NULL, next_attempt REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'pending', sid TEXT, checked REAL,
                 UNIQUE(incident,recipient,event,bucket));
-            CREATE TABLE IF NOT EXISTS local_sessions (token TEXT PRIMARY KEY, expires REAL NOT NULL, password_version TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS login_attempts (peer TEXT NOT NULL, at REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS runtime_health (id INTEGER PRIMARY KEY, at REAL NOT NULL, value TEXT NOT NULL);
             """)
             # Existing trusted receipts gain a checksum once, during schema migration.
@@ -462,8 +460,6 @@ class Store:
             db.execute('DELETE FROM audit WHERE at<?', (self.clock() - 7 * 86400,))
             db.execute('DELETE FROM outbox WHERE created<?', (self.clock() - 7 * 86400,))
             db.execute('DELETE FROM incidents WHERE resolved<? AND id NOT IN (SELECT incident FROM outbox WHERE incident IS NOT NULL)', (self.clock() - 7 * 86400,))
-            db.execute('DELETE FROM local_sessions WHERE expires<=?', (self.clock(),))
-            db.execute('DELETE FROM login_attempts WHERE at<=?', (self.clock() - 300,))
             db.execute('DELETE FROM ip_attempts WHERE at<=?', (self.clock() - 86400,))
             db.execute('DELETE FROM bad_codes WHERE at<?', (self.clock() - 300,))
             db.execute('DELETE FROM codes WHERE slot<? AND slot NOT IN (SELECT slot FROM codes ORDER BY slot DESC LIMIT 2)',

@@ -195,6 +195,12 @@ def main():
                 expect(admin.locator('#printer-status')).to_have_text('Cover open')
                 assert service.hardware_hold and not db.settings()['paused_printing']
                 expect(admin.locator('#incidents')).to_contain_text('Printer unavailable')
+                printer_card = admin.locator('#incidents .notice').filter(has_text='Printer unavailable')
+                printer_card.get_by_role('button', name='Acknowledge alert').click()
+                expect(admin.locator('#incidents')).not_to_contain_text('Printer unavailable')
+                admin.locator('#check-printer').click()
+                expect(admin.locator('#incidents')).not_to_contain_text('Printer unavailable')
+                assert service.hardware_hold
                 probe_status[0] = 'Online'
                 admin.locator('#check-printer').click()
                 expect(admin.locator('#printer-status')).to_have_text('Online')
@@ -203,6 +209,14 @@ def main():
                 while service.hardware_hold and time.time() < deadline:
                     time.sleep(.05)
                 assert not service.hardware_hold
+                deadline = time.time() + 5
+                while any(i['kind'] == 'printer' for i in db.incidents()) and time.time() < deadline:
+                    time.sleep(.05)
+                probe_status[0] = 'Cover open'
+                admin.locator('#check-printer').click()
+                expect(admin.locator('#incidents')).to_contain_text('Printer unavailable')
+                probe_status[0] = 'Online'
+                admin.locator('#check-printer').click()
                 admin.locator('#tab-ip').click()
                 expect(admin.locator('#ip-default-minute')).to_have_value('5')
                 expect(admin.locator('#ip-default-day')).to_have_value('10')

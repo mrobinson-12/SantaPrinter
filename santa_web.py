@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 import jwt
 from jwt import PyJWKClient
@@ -61,11 +61,6 @@ class ScheduleWindow(BaseModel):
         if any(type(day) is not int or not 0 <= day <= 6 for day in value) or len(set(value)) != len(value):
             raise ValueError('Days must be unique integers, Monday=0 through Sunday=6.')
         return value
-
-
-class Login(BaseModel):
-    model_config = ConfigDict(extra='forbid')
-    password: str = Field(min_length=1, max_length=256)
 
 
 class Settings(BaseModel):
@@ -199,11 +194,9 @@ class AccessVerifier:
             raise HTTPException(401, 'Invalid or expired Cloudflare Access token.') from None
 
 
-def create_app(store=None, service=None, verifier=None, start_background=True, lan=False):
+def create_app(store=None, service=None, verifier=None, start_background=True):
     access = verifier or AccessVerifier()
-    from santa_local_auth import LocalAuth
     from santa_notifications import NotificationService, credentials_ready, notification_fingerprint
-    local_auth = LocalAuth(store, os.getenv('SANTA_OWNER_PASSWORD_FILE') or str(store.directory / 'owner-password.hash')) if lan and store else None
     data_dir = Path(os.getenv('SANTA_DATA_DIR', str(ROOT / 'runtime'))).expanduser().resolve()
 
     @asynccontextmanager
@@ -239,14 +232,10 @@ def create_app(store=None, service=None, verifier=None, start_background=True, l
     app = FastAPI(title='Santa Printer', lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
     def admin(request: Request):
-        if lan:
-            if not local_auth:
-                raise HTTPException(503, 'LAN authentication unavailable.')
-            return local_auth.verify(request.cookies.get('santa_owner', ''))
         return access.verify(request.headers.get('Cf-Access-Jwt-Assertion', ''))
 
     def same_origin(request):
-        configured = os.getenv('SANTA_LAN_ORIGIN' if lan else 'PUBLIC_ORIGIN', '').rstrip('/')
+        configured = os.getenv('PUBLIC_ORIGIN', '').rstrip('/')
         if configured:
             expected = configured
         else:
@@ -260,15 +249,8 @@ def create_app(store=None, service=None, verifier=None, start_background=True, l
     async def security(request, call_next):
         is_admin = request.url.path == '/admin' or request.url.path.startswith('/admin/')
         try:
-            if lan and not (request.url.path.startswith('/admin') or request.url.path.startswith('/assets/') or request.url.path in ('/login', '/login/session')):
-                raise HTTPException(404, 'LAN listener is for administration only.')
             if is_admin:
-                try:
-                    request.state.actor = await asyncio.to_thread(admin, request)
-                except HTTPException as error:
-                    if lan and request.method == 'GET' and request.url.path.rstrip('/') == '/admin' and error.status_code == 401:
-                        return RedirectResponse('/login', status_code=303)
-                    raise
+                request.state.actor = await asyncio.to_thread(admin, request)
             # Bound JSON parsing, including chunked requests with no Content-Length.
             if request.method in ('POST', 'PUT', 'PATCH', 'DELETE'):
                 same_origin(request)
@@ -360,9 +342,8 @@ def create_app(store=None, service=None, verifier=None, start_background=True, l
         return dict(actor=request.state.actor, metrics=db.metrics(), settings=cfg, codes=db.codes(),
                     printer=request.app.state.service.printer_status, server_time=db.clock(),
                     model_ready=bool(os.getenv('OPENAI_API_KEY', '').strip()),
-                    health=request.app.state.service.health(), incidents=db.incidents(),
-                    notifications=dict(configured=credentials_ready(), tested=cfg['sms_tested'] and cfg.get('sms_credentials') == notification_fingerprint(cfg), history=NotificationService(db).history()),
-                    lan=lan)
+                    health=request.app.state.service.health(), incidents=[i for i in db.incidents() if not i['acknowledged']],
+                    notifications=dict(configured=credentials_ready(), tested=cfg['sms_tested'] and cfg.get('sms_credentials') == notification_fingerprint(cfg), history=NotificationService(db).history()))
 
     @app.get('/admin/api/jobs')
     def jobs(request: Request, state: str | None = None, search: str = Query('', max_length=100), page: int = Query(1, ge=1, le=1000000), page_size: int = Query(50, ge=1, le=200)):
@@ -505,25 +486,6 @@ def create_app(store=None, service=None, verifier=None, start_background=True, l
         with request.app.state.store.transaction() as db:
             request.app.state.store.audit_in(db, request.state.actor, 'paid AI test')
         return {'ok': True}
-
-    if lan:
-        @app.get('/login')
-        def login_page():
-            return FileResponse(ROOT / 'web' / 'login.html')
-
-        @app.post('/login/session')
-        async def login(body: Login, request: Request):
-            token = await asyncio.to_thread(local_auth.login, request.client.host, body.password)
-            response = JSONResponse({'ok': True})
-            response.set_cookie('santa_owner', token, max_age=8*3600, httponly=True, secure=True, samesite='strict', path='/')
-            return response
-
-        @app.post('/admin/api/logout')
-        def logout(request: Request):
-            local_auth.logout(request.cookies.get('santa_owner', ''))
-            response = JSONResponse({'ok': True})
-            response.delete_cookie('santa_owner', path='/')
-            return response
 
     app.mount('/assets', StaticFiles(directory=ROOT / 'web'), name='assets')
     return app

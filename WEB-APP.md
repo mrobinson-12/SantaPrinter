@@ -111,4 +111,4 @@ sudo systemctl restart santa-printer
 
 ## Reliability toolkit upgrade
 
-See [OPERATIONS.md](OPERATIONS.md) for the current worker/recovery behavior, Linux upgrade and rollback, LAN owner administration, scheduled Twilio alerts, backups, and event rehearsal. The older single-worker/manual-generation-recovery descriptions above are superseded by this toolkit. Queued jobs retain receipt layout and bytes but use the current printer destination. Interrupted generation resumes automatically, and prepared Santa letters are enabled as the AI-outage fallback. Queue API results now contain `items`, `total`, `page`, and `page_size`.
+See [OPERATIONS.md](OPERATIONS.md) for the current worker/recovery behavior, Linux upgrade and rollback, scheduled Twilio alerts, backups, and event rehearsal. The older single-worker/manual-generation-recovery descriptions above are superseded by this toolkit. Queued jobs retain receipt layout and bytes but use the current printer destination. Interrupted generation resumes automatically, and prepared Santa letters are enabled as the AI-outage fallback. Queue API results now contain `items`, `total`, `page`, and `page_size`.

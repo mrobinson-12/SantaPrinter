@@ -3,7 +3,6 @@
 import argparse
 from contextlib import contextmanager, closing
 import fcntl
-import getpass
 import hashlib
 import importlib.metadata
 import json
@@ -29,7 +28,7 @@ def load_environment():
                     raise ValueError('Invalid .env line; use KEY=value.')
                 os.environ.setdefault(key.strip(), value.strip().strip('\"\''))
 
-    for name in ('SANTA_DATA_DIR', 'SANTA_OWNER_PASSWORD_FILE', 'SANTA_LAN_CERT', 'SANTA_LAN_KEY'):
+    for name in ('SANTA_DATA_DIR',):
         value = os.getenv(name)
         if value:
             path = Path(value).expanduser()
@@ -104,7 +103,6 @@ def doctor(store, service=None, probe=True):
     add('AI credentials', bool(os.getenv('OPENAI_API_KEY')), 'Configured; use the paid test to verify connectivity' if os.getenv('OPENAI_API_KEY') else 'Missing; prepared-letter fallback available' if cfg['fallback_enabled'] else 'Missing')
     add('Public administration', bool(os.getenv('CF_ACCESS_AUD') and os.getenv('ADMIN_EMAILS') and os.getenv('CF_ACCESS_TEAM_DOMAIN')), 'Cloudflare settings present; verify login through the public site')
     add('Notifications', credentials_ready() and bool(cfg['sms_recipients'] and cfg['sms_schedule'] and cfg['sms_tested']), 'Requires credentials, recipients, weekly hours and delivered test messages')
-    add('LAN administration', bool(os.getenv('SANTA_LAN_HOST') and os.getenv('SANTA_LAN_ORIGIN') and Path(os.getenv('SANTA_OWNER_PASSWORD_FILE') or str(store.directory / 'owner-password.hash')).is_file()), 'Configure LAN HTTPS listener and owner password')
     return dict(checks=checks, physical_test_required=True)
 
 
@@ -152,14 +150,6 @@ def backup(directory, destination):
         for path in (directory / 'receipts').glob('*'):
             if re.fullmatch(r'[0-9a-f]{32}\.(?:bin|png)', path.name) and path.stem in retained and path.is_file() and not path.is_symlink():
                 shutil.copyfile(path, receipts / path.name)
-        password = directory / 'owner-password.hash'
-        if password.is_file() and not password.is_symlink():
-            shutil.copyfile(password, destination / password.name)
-        for name in ('cert.pem', 'key.pem'):
-            tls = directory / 'lan-tls' / name
-            if tls.is_file() and not tls.is_symlink():
-                (destination / 'lan-tls').mkdir(exist_ok=True, mode=0o700)
-                shutil.copyfile(tls, destination / 'lan-tls' / name)
         manifest = {}
         for path in destination.rglob('*'):
             if path.is_file():
@@ -179,6 +169,7 @@ def restore(directory, snapshot):
     manifest = json.loads((snapshot / 'manifest.json').read_text())
     if manifest.get('format') != 1 or 'santa.sqlite3' not in manifest.get('files', {}):
         raise ValueError('Unsupported or incomplete snapshot.')
+    # Accept legacy password/TLS files so snapshots made before LAN removal remain restorable.
     for name, digest in manifest['files'].items():
         if name not in ('santa.sqlite3', 'owner-password.hash', 'lan-tls/cert.pem', 'lan-tls/key.pem') and not re.fullmatch(r'receipts/[0-9a-f]{32}\.(?:bin|png)', name):
             raise ValueError('Invalid snapshot path.')
@@ -233,7 +224,6 @@ def main():
     commands = parser.add_subparsers(dest='command', required=True)
     commands.add_parser('doctor')
     commands.add_parser('bundle')
-    commands.add_parser('reset-owner-password')
     commands.add_parser('backup').add_argument('destination')
     commands.add_parser('restore').add_argument('snapshot')
     commands.add_parser('prune-backups').add_argument('root')
@@ -249,15 +239,6 @@ def main():
                 print(diagnostic_bundle(store).decode())
         elif args.command == 'prune-backups':
             prune_backups(args.root)
-        elif args.command == 'reset-owner-password':
-            from santa_local_auth import hash_password
-            password = getpass.getpass('New owner password: ')
-            if password != getpass.getpass('Repeat password: '):
-                raise ValueError('Passwords did not match.')
-            target = Path(os.getenv('SANTA_OWNER_PASSWORD_FILE') or str(directory / 'owner-password.hash'))
-            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            Store.atomic_write(target, hash_password(password).encode())
-            print('Owner password updated. Existing LAN sessions are invalidated.')
         else:
             with offline_lock(directory):
                 if args.command == 'backup':

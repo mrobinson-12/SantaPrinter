@@ -12,7 +12,6 @@ import pytest
 
 import print_nt8360 as printer
 import santa_reply
-from santa_local_auth import LocalAuth, hash_password
 from santa_notifications import (NotificationError, NotificationService, TIMEZONE,
                                  in_schedule, notification_fingerprint)
 from santa_service import Service
@@ -261,30 +260,6 @@ def test_backup_restore_and_lock_protection(db, monkeypatch, tmp_path):
         restore(db.directory, target)
 
 
-def test_local_auth_expiry_throttle_and_password_reset(db, tmp_path):
-    password = tmp_path / 'owner.hash'
-    password.write_text(hash_password('a strong owner password'))
-    auth = LocalAuth(db, password)
-    token = auth.login('peer', 'a strong owner password')
-    assert auth.verify(token) == 'local-owner'
-    db.clock.value += 8*3600
-    with pytest.raises(Exception) as error:
-        auth.verify(token)
-    assert error.value.status_code == 401
-    token = auth.login('peer', 'a strong owner password')
-    password.write_text(hash_password('a different owner password'))
-    with pytest.raises(Exception):
-        auth.verify(token)
-    for _ in range(5):
-        try:
-            auth.login('bad-peer', 'wrong')
-        except Exception:
-            pass
-    with pytest.raises(Exception) as error:
-        auth.login('bad-peer', 'a different owner password')
-    assert error.value.status_code == 429
-
-
 class PublicVerifier:
     def verify(self, token):
         from fastapi import HTTPException
@@ -293,27 +268,34 @@ class PublicVerifier:
         return 'owner@example.com'
 
 
-def test_lan_session_never_authenticates_public_listener(db, monkeypatch, tmp_path):
-    file = tmp_path / 'owner.hash'; file.write_text(hash_password('a strong owner password'))
-    monkeypatch.setenv('SANTA_OWNER_PASSWORD_FILE', str(file))
-    monkeypatch.setenv('SANTA_LAN_ORIGIN', 'https://lan.test:8443')
+def test_public_requires_cloudflare_and_has_no_local_login(db, monkeypatch):
     monkeypatch.setenv('PUBLIC_ORIGIN', 'https://public.test')
-    service = Service(db, probe=lambda *a: {'status': 'Online'})
-    with TestClient(create_app(db, service, start_background=False, lan=True), base_url='https://lan.test:8443') as local:
-        assert local.get('/admin', follow_redirects=False).status_code == 303
-        response = local.post('/login/session', json={'password': 'a strong owner password'}, headers={'Origin': 'https://lan.test:8443'})
-        assert response.status_code == 200 and 'Secure' in response.headers['set-cookie']
-        assert local.get('/admin/api/overview').status_code == 200
-        token = local.cookies.get('santa_owner')
-        assert local.get('/api/status').status_code == 404
-        with TestClient(create_app(db, service, PublicVerifier(), start_background=False), base_url='https://public.test') as public:
-            public.cookies.set('santa_owner', token)
-            assert public.get('/admin/api/overview').status_code == 401
-            assert public.get('/login').status_code == 404
-            assert public.get('/admin', headers={'Cf-Access-Jwt-Assertion': 'verified-public-token'}).status_code == 200
-        assert local.post('/admin/api/logout', json={}, headers={'Origin': 'https://public.test'}).status_code == 403
-        assert local.post('/admin/api/logout', json={}, headers={'Origin': 'https://lan.test:8443'}).status_code == 200
-        assert local.get('/admin/api/overview').status_code == 401
+    service = Service(db)
+    with TestClient(create_app(db, service, PublicVerifier(), start_background=False), base_url='https://public.test') as public:
+        public.cookies.set('santa_owner', 'old-local-session')
+        assert public.get('/admin/api/overview').status_code == 401
+        assert public.get('/login').status_code == 404
+        assert public.post('/login/session', json={'password': 'old password'}, headers={'Origin': 'https://public.test'}).status_code == 404
+        assert public.get('/admin', headers={'Cf-Access-Jwt-Assertion': 'verified-public-token'}).status_code == 200
+
+
+def test_acknowledged_incident_hidden_until_fault_recurs(db):
+    service = Service(db)
+    headers = {'Cf-Access-Jwt-Assertion': 'verified-public-token', 'Origin': 'https://public.test'}
+    with TestClient(create_app(db, service, PublicVerifier(), start_background=False), base_url='https://public.test') as client:
+        db.incident('printer', 'Printer unavailable.', True, 2)
+        first = client.get('/admin/api/overview', headers=headers).json()['incidents'][0]['id']
+        assert client.post(f'/admin/api/incidents/{first}/acknowledge', json={}, headers=headers).status_code == 200
+        for _ in range(3):
+            db.incident('printer', 'Printer unavailable.', True, 2)
+            assert client.get('/admin/api/overview', headers=headers).json()['incidents'] == []
+        assert db.incidents()[0]['acknowledged'] == 1
+        assert service.health()['status'] == 'Needs attention'
+        db.incident('printer', 'Printer unavailable.', False)
+        db.incident('printer', 'Printer unavailable.', True, 1)
+        incidents = client.get('/admin/api/overview', headers=headers).json()['incidents']
+        assert len(incidents) == 1 and incidents[0]['id'] != first
+        assert not incidents[0]['acknowledged']
 
 
 class SMS:
@@ -487,9 +469,8 @@ def test_preupgrade_snapshot_and_saved_receipt_hashes(tmp_path):
         assert 'preview_hash' not in {row[1] for row in conn.execute('PRAGMA table_info(jobs)')}
 
 
-def test_dual_listener_supervisor_https_and_singleton(tmp_path):
-    """Exercise the real supervisor on two ephemeral loopback ports, without hardware."""
-    import ssl
+def test_public_supervisor_singleton_and_ignores_removed_lan_settings(tmp_path):
+    """Exercise the public supervisor and singleton lock, without hardware."""
     import subprocess
     import sys
     import time
@@ -504,12 +485,9 @@ def test_dual_listener_supervisor_https_and_singleton(tmp_path):
     directory = tmp_path / 'runtime'
     store = Store(directory)
     store.update_settings({'printer_host': '127.0.0.1', 'printer_port': free_port(), 'webhook_url': 'http://127.0.0.1:' + str(free_port()) + '/code'}, 'test')
-    password = directory / 'owner-password.hash'; password.write_text(hash_password('a strong owner password'))
-    tls = directory / 'lan-tls'
-    subprocess.run([sys.executable, str(root / 'deploy/configure-lan.py'), '--host', '127.0.0.1', '--origin', 'https://127.0.0.1:' + str(lan_port), '--output', str(tls)], check=True, capture_output=True)
     env = dict(os.environ, SANTA_DATA_DIR=str(directory), SANTA_PUBLIC_PORT=str(public_port),
                SANTA_LAN_HOST='127.0.0.1', SANTA_LAN_PORT=str(lan_port), SANTA_LAN_ORIGIN='https://127.0.0.1:' + str(lan_port),
-               SANTA_LAN_CERT=str(tls / 'cert.pem'), SANTA_LAN_KEY=str(tls / 'key.pem'), SANTA_OWNER_PASSWORD_FILE=str(password),
+               SANTA_LAN_CERT='/missing/cert', SANTA_LAN_KEY='/missing/key', SANTA_OWNER_PASSWORD_FILE='/missing/password',
                PUBLIC_ORIGIN='', OPENAI_API_KEY='', CF_ACCESS_AUD='', TWILIO_ACCOUNT_SID='', TWILIO_AUTH_TOKEN='', TWILIO_FROM='')
     process = subprocess.Popen([sys.executable, str(root / 'run_web.py')], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
@@ -523,13 +501,9 @@ def test_dual_listener_supervisor_https_and_singleton(tmp_path):
                 if process.poll() is not None or time.monotonic() > deadline:
                     raise AssertionError('Supervisor failed: ' + process.stderr.read().decode() if process.poll() is not None else 'Supervisor startup timed out')
                 time.sleep(.1)
-        context = ssl.create_default_context(cafile=str(tls / 'cert.pem'))
-        origin = env['SANTA_LAN_ORIGIN']
-        request = urllib.request.Request(origin + '/login/session', data=json.dumps({'password': 'a strong owner password'}).encode(), headers={'Origin': origin, 'Content-Type': 'application/json'})
-        with urllib.request.urlopen(request, context=context, timeout=5) as response:
-            cookie = response.headers['Set-Cookie'].split(';')[0]
-        with urllib.request.urlopen(urllib.request.Request(origin + '/admin/api/overview', headers={'Cookie': cookie}), context=context, timeout=5) as response:
-            assert json.load(response)['actor'] == 'local-owner'
+        with socket.socket() as probe:
+            probe.settimeout(1)
+            assert probe.connect_ex(('127.0.0.1', lan_port)) != 0
         with pytest.raises(ValueError, match='service is running'):
             with offline_lock(directory):
                 pass

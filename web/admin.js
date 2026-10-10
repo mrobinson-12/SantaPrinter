@@ -47,7 +47,6 @@ function renderOverview(data) {
   $('delivery-status').classList.toggle('error', !delivered);
   text('printer-status', data.printer.status); text('printer-checked', time(data.printer.at));
   text('model-status', data.health.last_ai_success ? 'Last AI success: ' + time(data.health.last_ai_success) : data.model_ready ? 'Key configured; connection not verified' : 'Prepared letters: API key missing');
-  $('logout').hidden = !data.lan;
   text('event-health', data.health.status);
   const h = data.health;
   text('health-details', `${h.paused_printing ? 'Printing manually paused. ' : ''}${h.paused_submissions ? 'Submissions paused. ' : ''}${h.hardware_hold ? 'Printer on automatic hold. ' : ''}Oldest waiting: ${h.oldest_waiting_age === null ? 'none' : Math.floor(h.oldest_waiting_age) + ' seconds'}. Free storage: ${Math.round(h.disk_free / 1048576)} MB. Last transmission: ${time(h.last_sent)}.`);
@@ -55,6 +54,7 @@ function renderOverview(data) {
   text('generation-health', `Recent prepared letters: ${h.recent_generation.filter(j => j.fallback).length} / ${h.recent_generation.length}. Last fallback: ${time(h.last_fallback)}. Last AI issue: ${h.last_ai_error || 'none'}.`);
   $('incidents').replaceChildren();
   for (const incident of data.incidents) {
+    if (incident.acknowledged) continue;
     const card = document.createElement('div'); card.className = 'notice error';
     const description = document.createElement('p'); description.textContent = `${incident.summary} Affected: ${incident.affected}. Last checked: ${time(incident.checked)}.`; card.append(description);
     const actions = document.createElement('div'); actions.className = 'actions';
@@ -64,7 +64,6 @@ function renderOverview(data) {
     if (['uncertain', 'jobs', 'stalled'].includes(incident.kind)) action('View affected letters', () => { $('filter').value = incident.kind === 'uncertain' ? 'uncertain' : incident.kind === 'jobs' ? 'failed' : ''; queuePage = 1; $('tab-queue').click(); });
     if (['worker', 'disk', 'clock', 'app'].includes(incident.kind)) action('Open diagnostics', () => $('tab-diagnostics').click());
     if (!incident.acknowledged) action('Acknowledge alert', async () => { try { await api('incidents/' + incident.id + '/acknowledge', 'POST'); await refresh(); } catch (e) { notice(e.message, true); } });
-    else { const p = document.createElement('small'); p.textContent = 'Acknowledged; SMS reminders suppressed.'; actions.append(p); }
     card.append(actions); $('incidents').append(card);
   }
   text('sms-state', !data.notifications.configured ? 'Twilio credentials are not configured on the host.' : data.notifications.tested ? 'Test messages delivered to all recipients.' : 'Save settings and send a test; wait for delivery to every recipient.');
@@ -336,7 +335,6 @@ $('sms-test').onclick = async () => {
   try { const result = await api('notifications/test', 'POST'); notice(result.detail); await refresh(); } catch (e) { notice(e.message, true); } finally { $('sms-test').disabled = false; }
 };
 $('sms-enable').onclick = () => toggleSetting('sms_enabled');
-$('logout').onclick = async () => { try { await api('logout', 'POST'); location.assign('/login'); } catch (e) { notice(e.message, true); } };
 $('checklist-run').onclick = async () => {
   $('checklist-run').disabled = true;
   try { const result = await api('diagnostics/checklist'); $('checklist-results').replaceChildren(); for (const check of result.checks) { const item = document.createElement('li'); item.textContent = `${check.ok ? '✓' : 'Needs attention:'} ${check.name} — ${check.detail}`; $('checklist-results').append(item); } } catch (e) { notice(e.message, true); } finally { $('checklist-run').disabled = false; }
