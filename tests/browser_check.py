@@ -27,7 +27,7 @@ class TestAccess:
 
 
 def main():
-    for key in ('PUBLIC_ORIGIN', 'TRUST_CLOUDFLARE_HEADERS', 'TWILIO_ACCOUNT_SID', 'TWILIO_API_KEY_SID', 'TWILIO_API_KEY_SECRET', 'TWILIO_AUTH_TOKEN'):
+    for key in ('PUBLIC_ORIGIN', 'TRUST_CLOUDFLARE_HEADERS'):
         os.environ.pop(key, None)
     os.environ['OPENAI_API_KEY'] = 'mock-only-no-network'
     screenshots = ROOT / 'runtime' / 'qa'
@@ -149,24 +149,10 @@ def main():
                 admin.locator('#close-dialog').click()
                 admin.locator('#tab-settings').click()
                 admin.locator('#setting-retention_hours').fill('48')
-                admin.locator('#setting-sms_from').fill('+61400000001')
-                admin.locator('#setting-sms_to').fill('+61400000002, +61400000003')
-                expect(admin.locator('#setting-sms_message')).to_have_value('ALERT 🚨 Receipt Printer out of Paper - please refill the paper on the receipt printer')
-                admin.locator('#setting-sms_enabled').check()
                 admin.get_by_role('button', name='Save settings').click()
                 expect(admin.locator('#admin-status')).to_have_text('Settings saved.')
                 assert db.settings()['retention_hours'] == 48
-                assert db.settings()['sms_to'] == ['+61400000002', '+61400000003']
-                for width in (320, 375, 430, 1280):
-                    admin.set_viewport_size({'width': width, 'height': 900})
-                    assert admin.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), ('SMS settings', width)
-                admin.set_viewport_size({'width': 375, 'height': 900})
-                admin.screenshot(path=str(screenshots / 'admin-sms-settings.png'), full_page=True)
-                db.observe_paper('192.168.1.100', 9100, True)
                 admin.locator('#tab-diagnostics').click()
-                expect(admin.locator('#sms-alerts')).to_contain_text('+61400000002 · pending')
-                expect(admin.locator('#sms-alerts')).to_contain_text('+61400000003 · pending')
-                admin.screenshot(path=str(screenshots / 'admin-sms-alerts.png'), full_page=True)
                 admin.locator('#render-test').click()
                 expect(admin.locator('#diagnostic-preview')).to_be_visible()
                 assert len(sends) == 2

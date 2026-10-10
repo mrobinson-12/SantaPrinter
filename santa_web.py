@@ -19,7 +19,6 @@ from jwt import PyJWKClient
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from santa_service import Service, ROOT
-import santa_sms
 from santa_store import Store, Rejected
 
 
@@ -67,42 +66,7 @@ class Settings(BaseModel):
     failed_codes_per_ip: int | None = Field(default=None, ge=1, le=100)
     ip_per_minute: int | None = Field(default=None, ge=1, le=1000)
     ip_per_day: int | None = Field(default=None, ge=1, le=10000)
-    sms_enabled: bool | None = None
-    sms_from: str | None = Field(default=None, max_length=16)
-    sms_to: list[str] | None = Field(default=None, max_length=10)
-    sms_message: str | None = Field(default=None, min_length=1, max_length=1600)
     retention_hours: int | None = Field(default=None, ge=1, le=168)
-
-    @field_validator('sms_from')
-    @classmethod
-    def sms_sender(cls, value):
-        if value is None:
-            return value
-        value = value.strip()
-        if value and not re.fullmatch(r'\+[1-9][0-9]{7,14}', value):
-            raise ValueError('Use an international phone number such as +61412345678.')
-        return value
-
-    @field_validator('sms_to')
-    @classmethod
-    def sms_recipients(cls, values):
-        if values is None:
-            return values
-        cleaned = []
-        for value in values:
-            value = value.strip()
-            if not re.fullmatch(r'\+[1-9][0-9]{7,14}', value):
-                raise ValueError('Use international recipient numbers such as +61412345678.')
-            if value not in cleaned:
-                cleaned.append(value)
-        return cleaned
-
-    @field_validator('sms_message')
-    @classmethod
-    def sms_body(cls, value):
-        if value is not None and (not value.strip() or any(ord(c) < 32 and c not in '\n\r\t' for c in value)):
-            raise ValueError('Enter an alert message without control characters.')
-        return value
 
     @field_validator('printer_host')
     @classmethod
@@ -335,7 +299,7 @@ def create_app(store=None, service=None, verifier=None, start_background=True):
         cfg = db.settings()
         return dict(actor=request.state.actor, metrics=db.metrics(), settings=cfg, codes=db.codes(),
                     printer=request.app.state.service.printer_status, server_time=db.clock(),
-                    model_ready=bool(os.getenv('OPENAI_API_KEY', '').strip()), twilio_ready=santa_sms.configured())
+                    model_ready=bool(os.getenv('OPENAI_API_KEY', '').strip()))
 
     @app.get('/admin/api/jobs')
     def jobs(request: Request, state: str | None = None):
@@ -382,15 +346,6 @@ def create_app(store=None, service=None, verifier=None, start_background=True):
         db = request.app.state.store
         db.delete_ip_rule(body.ip, request.state.actor)
         return db.ip_controls()
-
-    @app.get('/admin/api/sms-alerts')
-    def sms_alerts(request: Request):
-        return request.app.state.store.sms_history()
-
-    @app.post('/admin/api/sms-alerts/{alert_id}/retry')
-    def retry_sms(alert_id: str, request: Request):
-        request.app.state.store.retry_sms(alert_id, request.state.actor)
-        return {'ok': True}
 
     @app.get('/admin/api/deliveries')
     def deliveries(request: Request):

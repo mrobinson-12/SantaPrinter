@@ -43,7 +43,6 @@ function renderOverview(data) {
   $('delivery-status').classList.toggle('error', !delivered);
   text('printer-status', data.printer.status); text('printer-checked', time(data.printer.at));
   text('model-status', data.model_ready ? 'API key configured' : 'API key missing');
-  text('sms-status', !data.settings.sms_enabled ? 'Disabled' : data.twilio_ready ? 'Enabled · credentials configured' : 'Enabled · credentials missing or invalid');
   text('pause-submissions', data.settings.paused_submissions ? 'Resume submissions' : 'Pause submissions');
   text('pause-printing', data.settings.paused_printing ? 'Resume printing' : 'Pause printing');
 }
@@ -61,7 +60,7 @@ function history(container, entries, audit = false) {
 async function loadHistory() {
   const deliveries = await api('deliveries');
   history('recent-deliveries', deliveries.slice(0, 8)); history('all-deliveries', deliveries);
-  if (currentTab === 'diagnostics') { history('audit', await api('audit'), true); await loadSMS(); }
+  if (currentTab === 'diagnostics') history('audit', await api('audit'), true);
 }
 async function loadJobs() {
   const jobs = await api('jobs' + ($('filter').value ? '?state=' + encodeURIComponent($('filter').value) : ''));
@@ -134,26 +133,24 @@ const fields = [
   ['browser_cooldown', 'Per-browser cooldown (seconds)', 'number', 0, 3600], ['global_per_minute', 'Letters per minute, globally', 'number', 1, 1000],
   ['ip_per_minute', 'Default submissions per IP / minute', 'number', 1, 1000], ['ip_per_day', 'Default submissions per IP / 24 hours', 'number', 1, 10000],
   ['queue_limit', 'Maximum outstanding jobs', 'number', 1, 500], ['failed_codes_per_ip', 'Failed codes per IP / five minutes', 'number', 1, 100],
-  ['retention_hours', 'Letter retention (hours)', 'number', 1, 168],
-  ['sms_enabled', 'Enable paper-out SMS alerts', 'checkbox'], ['sms_from', 'Twilio sending number (international format)', 'tel'],
-  ['sms_to', 'SMS recipients (comma-separated international numbers, up to 10)', 'phones'], ['sms_message', 'Paper-out alert message', 'textarea'], ['cut', 'Cut paper after each receipt', 'checkbox']
+  ['retention_hours', 'Letter retention (hours)', 'number', 1, 168], ['cut', 'Cut paper after each receipt', 'checkbox']
 ];
 function renderSettings(settings) {
   $('settings-fields').replaceChildren();
   for (const [name, labelText, type, min, max] of fields) {
     const div = document.createElement('div'), label = document.createElement('label'); label.htmlFor = 'setting-' + name; label.textContent = labelText;
-    const input = document.createElement(['textarea', 'phones'].includes(type) ? 'textarea' : 'input'); input.id = 'setting-' + name; input.name = name;
-    if (!['textarea', 'phones'].includes(type)) input.type = type;
+    const input = document.createElement(type === 'textarea' ? 'textarea' : 'input'); input.id = 'setting-' + name; input.name = name;
+    if (type !== 'textarea') input.type = type;
     if (type === 'checkbox') { input.checked = settings[name]; div.className = 'checkbox-row'; div.append(input, label); }
-    else { input.value = type === 'phones' ? settings[name].join(', ') : settings[name]; input.required = !['sms_from', 'sms_to'].includes(name); if (min !== undefined) { input.min = min; input.max = max; input.step = '1'; } div.append(label, input); }
-    if (['webhook_url', 'visitor_title', 'visitor_intro', 'sms_enabled', 'sms_to', 'sms_message'].includes(name)) div.classList.add('wide');
-    if (type === 'text' || type === 'textarea') input.maxLength = name === 'sms_message' ? 1600 : name === 'visitor_intro' ? 500 : name === 'visitor_title' ? 120 : 253;
+    else { input.value = settings[name]; input.required = true; if (min !== undefined) { input.min = min; input.max = max; input.step = '1'; } div.append(label, input); }
+    if (['webhook_url', 'visitor_title', 'visitor_intro'].includes(name)) div.classList.add('wide');
+    if (type === 'text' || type === 'textarea') input.maxLength = name === 'visitor_intro' ? 500 : name === 'visitor_title' ? 120 : 253;
     $('settings-fields').append(div);
   }
 }
 $('settings-form').addEventListener('submit', async event => {
   event.preventDefault(); const body = {}, button = event.submitter;
-  for (const [name, _, type] of fields) { const input = $('setting-' + name); body[name] = type === 'checkbox' ? input.checked : type === 'number' ? Number(input.value) : type === 'phones' ? input.value.split(/[,\n]/).map(value => value.trim()).filter(Boolean) : input.value; }
+  for (const [name, _, type] of fields) { const input = $('setting-' + name); body[name] = type === 'checkbox' ? input.checked : type === 'number' ? Number(input.value) : input.value; }
   button.disabled = true;
   try { await api('settings', 'PATCH', body); notice('Settings saved.'); await refresh(); }
   catch (error) { notice(error.message, true); }
@@ -270,25 +267,3 @@ $('ip-rule-form').onsubmit = async event => {
     await loadIPs(); notice('IP rule saved.');
   } catch (error) { notice(error.message, true); } finally { event.submitter.disabled = false; }
 };
-
-async function loadSMS() {
-  const alerts = await api('sms-alerts'); $('sms-alerts').replaceChildren();
-  if (!alerts.length) { $('sms-alerts').textContent = 'No paper-out SMS alerts yet.'; return; }
-  for (const row of alerts) {
-    const item = document.createElement('div'); item.className = 'audit-item';
-    const title = document.createElement('div'); title.textContent = `${row.recipient} · ${row.state} · ${row.attempts} attempt(s)`;
-    const detail = document.createElement('small'); detail.textContent = time(row.updated) + ' · ' + (row.detail || 'Waiting to send') + (row.sid ? ' · ' + row.sid : '');
-    item.append(title, detail);
-    if (['failed', 'uncertain', 'cancelled'].includes(row.state)) {
-      const retry = document.createElement('button'); retry.className = 'secondary'; retry.textContent = 'Retry alert';
-      retry.onclick = async () => {
-        if (!await confirmAction('Retry SMS alert?', 'Send the paper-out message to ' + row.recipient + ' if this incident is still active. An uncertain send may already have reached Twilio; check its logs first to avoid a duplicate.')) return;
-        retry.disabled = true;
-        try { await api('sms-alerts/' + row.id + '/retry', 'POST'); await loadSMS(); notice('SMS alert scheduled for retry.'); }
-        catch (error) { notice(error.message, true); }
-        finally { retry.disabled = false; }
-      }; item.append(retry);
-    }
-    $('sms-alerts').append(item);
-  }
-}

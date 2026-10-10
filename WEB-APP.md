@@ -108,25 +108,3 @@ git pull --ff-only
 .venv/bin/python -m pip install -r requirements.txt
 sudo systemctl restart santa-printer
 ```
-
-## Paper-out SMS alerts (Twilio)
-
-In `.env`, configure your Twilio Account SID and API key credentials:
-
-```dotenv
-TWILIO_ACCOUNT_SID=AC_your_account_sid
-TWILIO_API_KEY_SID=SK_your_api_key_sid
-TWILIO_API_KEY_SECRET=your_api_key_secret
-```
-
-Use the actual SIDs from Twilio (AC or SK followed by 32 hexadecimal characters). Alternatively, leave both API key fields blank and set `TWILIO_AUTH_TOKEN` with your account Auth Token. Credentials stay server-side and are never returned to the admin browser or stored in SQLite. Restart the service after changing `.env`. No additional Python dependency is needed.
-
-In **Admin → Settings**, enter the SMS-capable Twilio sending number and up to ten recipient numbers, then enable paper-out SMS alerts and save. Use international format, e.g. `+61412345678`; recipients may be separated by commas or newlines. The message is editable and defaults to:
-
-> ALERT 🚨 Receipt Printer out of Paper - please refill the paper on the receipt printer
-
-The overview reports whether credentials are configured. The backend checks printer status roughly every 30 seconds, including while printing is paused; status checks and printing share a lock so their bytes cannot mix. A confirmed paper-empty status queues one SMS per recipient per incident. Low paper, offline, and unknown status alone do not trigger alerts. Unknown status does not reset an incident. A confirmed refill resets it for the next paper-out incident. Persisted incident state prevents repeated alerts after restart. Pending alerts are cancelled when paper is refilled, a recipient is removed, alerts are disabled, or the printer changes. Missing credentials leave alerts pending until configured.
-
-**Admin → Diagnostics → SMS alert history** shows attempts, acceptance/failure, and Twilio message SIDs. Accepted means Twilio accepted the SMS, not confirmed handset delivery. Only explicit HTTP 429 rejections retry automatically, up to three attempts. Network timeouts, server errors, or interrupted sends become uncertain and require review in Twilio logs before a confirmed manual retry. Other failures can also be retried explicitly while the paper-out incident remains active. Retry actions are audited. History normally expires after seven days; active incident records and unresolved alerts are retained to prevent duplicates.
-
-Automated tests mock Twilio and send no real SMS. Confirm real paper status and SMS reception with your printer and Twilio account before relying on alerts at the display.
