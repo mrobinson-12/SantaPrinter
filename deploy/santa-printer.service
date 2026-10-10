@@ -1,0 +1,18 @@
+# Replace paths and User before copying to /etc/systemd/system/.
+[Unit]
+Description=Santa Printer web app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=santa
+WorkingDirectory=/opt/SantaPrinter
+ExecStart=/opt/SantaPrinter/.venv/bin/python /opt/SantaPrinter/run_web.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=65
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

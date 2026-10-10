@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#184b3d"><meta name="description" content="Send your Christmas wish to Santa and collect a little letter at the event.">
+  <title>Letters from Santa</title><link rel="icon" href="/assets/santa.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/style.css"><script src="/assets/visitor.js" defer></script>
+</head>
+<body class="visitor">
+  <header class="masthead"><a class="brand" href="/"><img src="/assets/santa.svg" alt="" width="40" height="40"><span>NORTH POLE<br><small>LETTER DEPARTMENT</small></span></a><span class="season">A little Christmas magic</span></header>
+  <main class="visitor-main">
+    <section class="intro" aria-labelledby="title">
+      <div class="eyebrow"><span aria-hidden="true">✦</span> SPECIAL DELIVERY FROM SANTA</div>
+      <h1 id="title">A little letter.<br>A lot of Christmas magic.</h1>
+      <p id="intro">Tell Santa what is on your Christmas wish list. A personal letter will be waiting at the printer.</p>
+      <div class="postmark" aria-hidden="true"><img src="/assets/santa.svg" alt="" width="92" height="92"><span>WITH LOVE<br>FROM THE NORTH POLE</span></div>
+    </section>
+    <section class="letter-panel" aria-labelledby="form-heading">
+      <div class="panel-top"><span class="eyebrow">YOUR CHRISTMAS LETTER</span><span aria-hidden="true">✦</span></div>
+      <div id="closed" class="notice" hidden>Santa is taking a short break. Please check back soon.</div>
+      <form id="letter-form" novalidate>
+        <h2 id="form-heading">Dear Santa,</h2>
+        <label for="name">My first name <span class="optional">(optional)</span></label>
+        <input id="name" name="name" maxlength="60" placeholder="Your first name" autocomplete="given-name" aria-describedby="name-error">
+        <p id="name-error" class="field-error" hidden></p>
+        <label for="message">This Christmas, I would love…</label>
+        <textarea id="message" name="message" rows="4" maxlength="1000" required placeholder="A telescope to see the stars, a cheeseburger, or something only you could think of…" aria-describedby="message-error counter"></textarea>
+        <div class="input-foot"><p id="message-error" class="field-error" hidden></p><span id="counter">0 / 1,000</span></div>
+        <div class="code-block"><label for="code">Your event code</label><p id="code-hint">Enter the code shown at the event.</p>
+          <input id="code" name="code" type="text" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="off" required placeholder="0000" aria-describedby="code-hint code-error">
+          <p id="code-error" class="field-error" hidden></p>
+        </div>
+        <p id="form-error" class="notice error" role="alert" hidden></p>
+        <button id="submit" class="primary" type="submit">Send to Santa <span aria-hidden="true">↗</span></button>
+        <p class="fine-print">One little wish. One personal letter. Collect yours at the event printer.</p>
+      </form>
+      <section id="result" hidden aria-labelledby="result-heading">
+        <span class="eyebrow">NORTH POLE POST</span><h2 id="result-heading" tabindex="-1">Your letter is on its way.</h2>
+        <div id="job-status" class="status-line" role="status" aria-live="polite"></div>
+        <p id="job-error" class="notice error" role="alert" hidden></p>
+        <div id="receipt" class="receipt" hidden><p class="receipt-caption">A LITTLE LETTER JUST FOR YOU</p><p id="reply" class="reply"></p><img id="preview" alt="Your Santa receipt, exactly as sent to the printer" hidden></div>
+        <p id="collect" hidden>Collect your letter at the event printer. If it has not appeared, ask the event team.</p>
+        <button id="another" type="button" class="secondary" hidden>Write another letter</button>
+      </section>
+    </section>
+    <div class="how-it-works"><span><b>01</b> Make a wish</span><span><b>02</b> Santa writes back</span><span><b>03</b> Collect your letter</span></div>
+  </main>
+  <footer class="visitor-footer"><span aria-hidden="true">✦</span> Made with North Pole magic <span aria-hidden="true">✦</span><p>Your letter is stored briefly so the event team can help with printing.</p><a href="/admin">Event team</a></footer>
+</body>
+</html>

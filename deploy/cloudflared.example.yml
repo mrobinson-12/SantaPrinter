@@ -1,0 +1,8 @@
+# Use your existing tunnel ID and credentials path.
+tunnel: YOUR-TUNNEL-UUID
+credentials-file: /absolute/path/to/YOUR-TUNNEL-UUID.json
+
+ingress:
+  - hostname: santa.example.com
+    service: http://127.0.0.1:8000
+  - service: http_status:404
