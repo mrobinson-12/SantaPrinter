@@ -16,7 +16,8 @@ DEFAULTS = dict(printer_host='192.168.1.100', printer_port=9100,
                 paused_submissions=False, paused_printing=False,
                 browser_cooldown=60, global_per_minute=10, queue_limit=50,
                 failed_codes_per_ip=10, retention_hours=24,
-                ip_per_minute=5, ip_per_day=10)
+                ip_per_minute=5, ip_per_day=10, sms_enabled=False, sms_from='', sms_to=[],
+                sms_message='ALERT 🚨 Receipt Printer out of Paper - please refill the paper on the receipt printer')
 ACTIVE = ('waiting', 'generating', 'ready', 'sending', 'uncertain')
 
 
@@ -55,6 +56,12 @@ class Store:
             CREATE INDEX IF NOT EXISTS ip_attempts_window ON ip_attempts(ip,at);
             CREATE TABLE IF NOT EXISTS ip_rules (ip TEXT PRIMARY KEY, blocked INTEGER NOT NULL,
                 per_minute INTEGER, per_day INTEGER, note TEXT NOT NULL, updated REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS paper_state (printer TEXT PRIMARY KEY, empty INTEGER NOT NULL, incident TEXT);
+            CREATE TABLE IF NOT EXISTS sms_alerts (id TEXT PRIMARY KEY, incident TEXT NOT NULL,
+                printer TEXT NOT NULL, recipient TEXT NOT NULL, sender TEXT NOT NULL, message TEXT NOT NULL,
+                state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL,
+                created REAL NOT NULL, updated REAL NOT NULL, detail TEXT, sid TEXT,
+                UNIQUE(incident,recipient));
             CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, at REAL NOT NULL,
                 actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);
             ''')
@@ -108,6 +115,8 @@ class Store:
                     "SELECT 1 FROM jobs WHERE state='uncertain' LIMIT 1").fetchone():
                 raise Rejected('Review uncertain print jobs before resuming printing.', 409)
             settings.update(changes)
+            if settings['sms_enabled'] and (not settings['sms_from'] or not settings['sms_to']):
+                raise Rejected('Set the Twilio sending number and at least one recipient before enabling SMS alerts.')
             db.execute('UPDATE settings SET value=? WHERE id=1', (json.dumps(settings),))
             self.audit_in(db, actor, 'settings', json.dumps(changes))
         return settings
@@ -395,9 +404,74 @@ class Store:
                     (self.files / (row['id'] + extension)).unlink(missing_ok=True)
                 db.execute('DELETE FROM jobs WHERE id=?', (row['id'],))
             # Diagnostics contain no letter content, but still have a finite retention.
+            db.execute("DELETE FROM sms_alerts WHERE updated<? AND state NOT IN ('pending','sending','uncertain') AND incident NOT IN (SELECT incident FROM paper_state WHERE empty=1 AND incident IS NOT NULL)", (self.clock() - 7 * 86400,))
             db.execute('DELETE FROM deliveries WHERE at<?', (self.clock() - 7 * 86400,))
             db.execute('DELETE FROM audit WHERE at<?', (self.clock() - 7 * 86400,))
             db.execute('DELETE FROM ip_attempts WHERE at<=?', (self.clock() - 86400,))
             db.execute('DELETE FROM bad_codes WHERE at<?', (self.clock() - 300,))
             db.execute('DELETE FROM codes WHERE slot<? AND slot NOT IN (SELECT slot FROM codes ORDER BY slot DESC LIMIT 2)',
                        (int(self.clock() // 300) - 3,))
+
+
+    def observe_paper(self, host, port, empty):
+        if empty is None:
+            return  # Unknown/offline status never rearms a paper-out incident.
+        printer = host + ':' + str(port)
+        with self.transaction() as db:
+            cfg, now = self.settings_in(db), self.clock()
+            if host != cfg['printer_host'] or port != cfg['printer_port']:
+                return  # Ignore a status query for a printer whose settings just changed.
+            previous = db.execute('SELECT * FROM paper_state WHERE printer=?', (printer,)).fetchone()
+            if not empty:
+                db.execute("UPDATE sms_alerts SET state='cancelled',updated=?,detail='Paper refilled before this alert was sent.' WHERE printer=? AND state='pending'", (now, printer))
+                db.execute('INSERT INTO paper_state VALUES (?,0,NULL) ON CONFLICT(printer) DO UPDATE SET empty=0,incident=NULL', (printer,))
+                return
+            incident = previous['incident'] if previous and previous['empty'] else uuid.uuid4().hex
+            db.execute('INSERT INTO paper_state VALUES (?,1,?) ON CONFLICT(printer) DO UPDATE SET empty=1,incident=excluded.incident', (printer, incident))
+            if cfg['sms_enabled']:
+                for recipient in cfg['sms_to']:
+                    db.execute('INSERT INTO sms_alerts(id,incident,printer,recipient,sender,message,state,next_attempt,created,updated) '
+                               "VALUES (?,?,?,?,?,?,'pending',?,?,?) ON CONFLICT(incident,recipient) DO NOTHING",
+                               (uuid.uuid4().hex, incident, printer, recipient, cfg['sms_from'], cfg['sms_message'], now, now, now))
+
+    def claim_sms(self):
+        with self.transaction() as db:
+            cfg, now = self.settings_in(db), self.clock()
+            for row in db.execute("SELECT * FROM sms_alerts WHERE state='pending' AND next_attempt<=? ORDER BY created", (now,)).fetchall():
+                paper = db.execute('SELECT * FROM paper_state WHERE printer=?', (row['printer'],)).fetchone()
+                current_printer = cfg['printer_host'] + ':' + str(cfg['printer_port'])
+                if not cfg['sms_enabled'] or row['recipient'] not in cfg['sms_to'] or row['printer'] != current_printer or not paper or not paper['empty'] or paper['incident'] != row['incident']:
+                    db.execute("UPDATE sms_alerts SET state='cancelled',updated=?,detail='Alert no longer enabled, configured, or relevant.' WHERE id=?", (now, row['id']))
+                    continue
+                # Apply current sender/message to messages that have not left the server.
+                db.execute("UPDATE sms_alerts SET state='sending',attempts=attempts+1,updated=?,sender=?,message=? WHERE id=?", (now, cfg['sms_from'], cfg['sms_message'], row['id']))
+                return {**dict(row), 'sender': cfg['sms_from'], 'message': cfg['sms_message'], 'state': 'sending', 'attempts': row['attempts'] + 1}
+            return None
+
+    def finish_sms(self, alert, result):
+        state = result['state']
+        if state == 'retry':
+            state = 'pending' if alert['attempts'] < 3 else 'failed'
+        assert state in ('accepted', 'pending', 'failed', 'uncertain')
+        with self.transaction() as db:
+            db.execute("UPDATE sms_alerts SET state=?,updated=?,next_attempt=?,detail=?,sid=? WHERE id=? AND state='sending'",
+                       (state, self.clock(), self.clock() + (30 if alert['attempts'] == 1 else 120), result['detail'], result.get('sid'), alert['id']))
+
+    def recover_sms(self):
+        with self.transaction() as db:
+            db.execute("UPDATE sms_alerts SET state='uncertain',updated=?,detail='SMS send interrupted by restart. Check Twilio logs; no automatic resend.' WHERE state='sending'", (self.clock(),))
+
+    def sms_history(self):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute('SELECT * FROM sms_alerts ORDER BY created DESC,id LIMIT 100')]
+
+    def retry_sms(self, alert_id, actor):
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM sms_alerts WHERE id=?', (alert_id,)).fetchone()
+            if not row or row['state'] not in ('failed', 'uncertain', 'cancelled'):
+                raise Rejected('Only failed, uncertain, or cancelled alerts can be retried.', 409)
+            paper = db.execute('SELECT * FROM paper_state WHERE printer=?', (row['printer'],)).fetchone()
+            if not paper or not paper['empty'] or paper['incident'] != row['incident']:
+                raise Rejected('This paper-out incident has ended.', 409)
+            db.execute("UPDATE sms_alerts SET state='pending',attempts=0,next_attempt=0,updated=?,detail='Retry requested by admin.' WHERE id=?", (self.clock(), alert_id))
+            self.audit_in(db, actor, 'retry SMS alert', alert_id)

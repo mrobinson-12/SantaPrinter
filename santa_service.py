@@ -10,6 +10,7 @@ import urllib.request
 
 import print_nt8360 as printer
 import santa_reply
+import santa_sms
 
 logger = logging.getLogger('santa')
 ROOT = Path(__file__).resolve().parent
@@ -41,7 +42,7 @@ def probe_printer(host, port):
                 connection.sendall(bytes([0x10, 0x04, number]))
                 value = connection.recv(1)
                 if len(value) != 1 or value[0] & 0x93 != 0x12:
-                    return {'status': 'Unknown', 'checked': True}
+                    return {'status': 'Unknown', 'checked': True, 'paper_empty': None}
                 values.append(value[0])
         problems = []
         if values[0] & 0x08:
@@ -54,18 +55,20 @@ def probe_printer(host, port):
             problems.append('Printer error')
         if values[3] & 0x0c:
             problems.append('Paper low')
-        return {'status': ', '.join(problems) if problems else 'Online', 'checked': True}
+        return {'status': ', '.join(problems) if problems else 'Online', 'checked': True,
+                'paper_empty': bool(values[1] & 0x20 or values[3] & 0x60)}
     except OSError:
-        return {'status': 'Unknown', 'checked': True}
+        return {'status': 'Unknown', 'checked': True, 'paper_empty': None}
 
 
 class Service:
-    def __init__(self, store, generate=None, send=None, webhook=None, probe=None):
+    def __init__(self, store, generate=None, send=None, webhook=None, probe=None, sms=None):
         self.store = store
         self.generate = generate or santa_reply.generate_reply
         self.send = send or printer.send_job
         self.webhook = webhook or deliver_code
         self.probe = probe or probe_printer
+        self.sms = sms or santa_sms.send_sms
         self.stopping = False
         self.printer_status = {'status': 'Unknown', 'checked': False}
         self.last_probe = 0
@@ -115,6 +118,7 @@ class Service:
         cfg = self.store.settings()
         self.printer_status = {**self.probe(cfg['printer_host'], cfg['printer_port']), 'at': self.store.clock()}
         self.last_probe = self.store.clock()
+        self.store.observe_paper(cfg['printer_host'], cfg['printer_port'], self.printer_status.get('paper_empty'))
         return self.printer_status
 
     async def check_printer(self):
@@ -146,16 +150,41 @@ class Service:
                     else:
                         async with self.printer_lock:
                             await asyncio.to_thread(self.send_job, job)
-                elif self.store.clock() - self.last_probe > 30:
-                    await self.check_printer()
+
             except Exception:
                 logger.error('Queue worker encountered an error; it will retry.')
             await asyncio.sleep(0.5)
 
+    async def paper_loop(self):
+        while not self.stopping:
+            try:
+                if self.store.clock() - self.last_probe >= 30:
+                    await self.check_printer()
+            except Exception:
+                logger.error('Printer paper monitor encountered an error; it will retry.')
+            await asyncio.sleep(1)
+
+    async def sms_loop(self):
+        while not self.stopping:
+            try:
+                if santa_sms.configured():
+                    alert = self.store.claim_sms()
+                    if alert:
+                        try:
+                            result = await asyncio.to_thread(self.sms, alert['sender'], alert['recipient'], alert['message'])
+                        except Exception:
+                            result = {'state': 'uncertain', 'detail': 'SMS send failed unexpectedly. Check Twilio logs before retrying.', 'sid': None}
+                        self.store.finish_sms(alert, result)
+            except Exception:
+                logger.error('SMS dispatcher encountered an error; it will retry.')
+            await asyncio.sleep(0.5)
+
     def start(self):
         self.store.recover()
+        self.store.recover_sms()
         self.store.rotate()
-        self.tasks = [asyncio.create_task(self.codes_loop()), asyncio.create_task(self.worker_loop())]
+        self.tasks = [asyncio.create_task(self.codes_loop()), asyncio.create_task(self.worker_loop()),
+                      asyncio.create_task(self.paper_loop()), asyncio.create_task(self.sms_loop())]
 
     async def stop(self):
         self.stopping = True
