@@ -1,18 +1,24 @@
-# Replace paths and User before copying to /etc/systemd/system/.
+# Replace paths and User, or generate all units with install-linux-services.py.
 [Unit]
 Description=Santa Printer web app
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=santa
 WorkingDirectory=/opt/SantaPrinter
 ExecStart=/opt/SantaPrinter/.venv/bin/python /opt/SantaPrinter/run_web.py
-Restart=always
+Restart=on-failure
 RestartSec=5
-TimeoutStopSec=65
+TimeoutStopSec=90
 UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=append:/opt/SantaPrinter/runtime/service.log
+StandardError=append:/opt/SantaPrinter/runtime/service.log
 
 [Install]
 WantedBy=multi-user.target

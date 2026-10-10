@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 const text = (id, value) => { $(id).textContent = value; };
 let currentTab = 'overview', overview = null, selectedJob = null, codeSnapshotAt = 0, serverSnapshot = 0, previewURL = null;
-let loading = false, messageTimer = null;
+let loading = false, messageTimer = null, queuePage = 1, queueTotal = 0, smsDirty = false, smsSnapshot = null;
 function notice(message, bad = false) {
   text('admin-status', message); $('admin-status').hidden = !message;
   $('admin-status').classList.toggle('error', bad);
@@ -10,12 +10,16 @@ function notice(message, bad = false) {
   if (!bad) messageTimer = setTimeout(() => { $('admin-status').hidden = true; }, 6000);
 }
 async function api(path, method = 'GET', body = {}, raw = false) {
-  const response = await fetch('/admin/api/' + path, { credentials: 'same-origin', method,
-    ...(method !== 'GET' ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}) });
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), ['diagnostics/ai-test', 'notifications/test'].includes(path) ? 60000 : 20000);
+  let response;
+  try { response = await fetch('/admin/api/' + path, { credentials: 'same-origin', method, signal: controller.signal,
+    ...(method !== 'GET' ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}) }); }
+  catch (failure) { if (failure.name === 'AbortError') throw new Error('Request timed out. Check service health before repeating a print action.'); throw failure; }
+  finally { clearTimeout(timer); }
   if (!response.ok) {
     let detail = 'Admin session expired or request failed. Reload to sign in again.';
     try { const data = await response.json(); detail = data.detail || detail; if (data.fields) detail += ' ' + Object.entries(data.fields).map(([key, value]) => key + ': ' + value).join('; '); } catch (_) {}
-    throw new Error(detail);
+    throw Object.assign(new Error(detail), { status: response.status });
   }
   return raw ? response.blob() : response.json();
 }
@@ -42,7 +46,33 @@ function renderOverview(data) {
   text('delivery-status', data.codes.clock_warning ? 'Server clock moved backwards. Correct it before accepting codes.' : delivered ? 'Current code delivered to the webhook.' : 'Current code has not been delivered. The scheduler is retrying.');
   $('delivery-status').classList.toggle('error', !delivered);
   text('printer-status', data.printer.status); text('printer-checked', time(data.printer.at));
-  text('model-status', data.model_ready ? 'API key configured' : 'API key missing');
+  text('model-status', data.health.last_ai_success ? 'Last AI success: ' + time(data.health.last_ai_success) : data.model_ready ? 'Key configured; connection not verified' : 'Prepared letters: API key missing');
+  $('logout').hidden = !data.lan;
+  text('event-health', data.health.status);
+  const h = data.health;
+  text('health-details', `${h.paused_printing ? 'Printing manually paused. ' : ''}${h.paused_submissions ? 'Submissions paused. ' : ''}${h.hardware_hold ? 'Printer on automatic hold. ' : ''}Oldest waiting: ${h.oldest_waiting_age === null ? 'none' : Math.floor(h.oldest_waiting_age) + ' seconds'}. Free storage: ${Math.round(h.disk_free / 1048576)} MB. Last transmission: ${time(h.last_sent)}.`);
+  text('worker-health', 'Workers: ' + (Object.entries(h.workers).map(([name, state]) => name.replaceAll('_', ' ') + ': ' + (state.healthy ? 'running' : 'stale')).join(' · ') || 'not started'));
+  text('generation-health', `Recent prepared letters: ${h.recent_generation.filter(j => j.fallback).length} / ${h.recent_generation.length}. Last fallback: ${time(h.last_fallback)}. Last AI issue: ${h.last_ai_error || 'none'}.`);
+  $('incidents').replaceChildren();
+  for (const incident of data.incidents) {
+    const card = document.createElement('div'); card.className = 'notice error';
+    const description = document.createElement('p'); description.textContent = `${incident.summary} Affected: ${incident.affected}. Last checked: ${time(incident.checked)}.`; card.append(description);
+    const actions = document.createElement('div'); actions.className = 'actions';
+    function action(label, fn) { const b = document.createElement('button'); b.className = 'secondary'; b.textContent = label; b.onclick = fn; actions.append(b); }
+    if (incident.kind === 'printer') action('Check printer again', () => $('check-printer').click());
+    if (incident.kind === 'codes') action('Resend current code', () => $('resend').click());
+    if (['uncertain', 'jobs', 'stalled'].includes(incident.kind)) action('View affected letters', () => { $('filter').value = incident.kind === 'uncertain' ? 'uncertain' : incident.kind === 'jobs' ? 'failed' : ''; queuePage = 1; $('tab-queue').click(); });
+    if (['worker', 'disk', 'clock', 'app'].includes(incident.kind)) action('Open diagnostics', () => $('tab-diagnostics').click());
+    if (!incident.acknowledged) action('Acknowledge alert', async () => { try { await api('incidents/' + incident.id + '/acknowledge', 'POST'); await refresh(); } catch (e) { notice(e.message, true); } });
+    else { const p = document.createElement('small'); p.textContent = 'Acknowledged; SMS reminders suppressed.'; actions.append(p); }
+    card.append(actions); $('incidents').append(card);
+  }
+  text('sms-state', !data.notifications.configured ? 'Twilio credentials are not configured on the host.' : data.notifications.tested ? 'Test messages delivered to all recipients.' : 'Save settings and send a test; wait for delivery to every recipient.');
+  text('sms-enable', data.settings.sms_enabled ? 'Disable SMS' : 'Enable SMS');
+  $('sms-enable').disabled = !data.settings.sms_enabled && !data.notifications.tested;
+  $('sms-history').replaceChildren();
+  for (const row of data.notifications.history.slice(0, 8)) { const p = document.createElement('p'); p.textContent = `${time(row.created)} · ${row.recipient} · ${row.event.startsWith('test:') ? 'test' : row.event} · ${row.status}`; $('sms-history').append(p); }
+  if (!smsDirty) renderSMSSettings(data.settings);
   text('pause-submissions', data.settings.paused_submissions ? 'Resume submissions' : 'Pause submissions');
   text('pause-printing', data.settings.paused_printing ? 'Resume printing' : 'Pause printing');
 }
@@ -63,14 +93,17 @@ async function loadHistory() {
   if (currentTab === 'diagnostics') history('audit', await api('audit'), true);
 }
 async function loadJobs() {
-  const jobs = await api('jobs' + ($('filter').value ? '?state=' + encodeURIComponent($('filter').value) : ''));
+  const query = new URLSearchParams({ page: queuePage, search: $('queue-search').value });
+  if ($('filter').value) query.set('state', $('filter').value);
+  const result = await api('jobs?' + query); const jobs = result.items; queueTotal = result.total;
+  text('queue-page', `Page ${queuePage} · ${queueTotal} letters`); $('queue-prev').disabled = queuePage <= 1; $('queue-next').disabled = queuePage * result.page_size >= queueTotal;
   $('jobs').replaceChildren(); $('empty-jobs').hidden = jobs.length !== 0;
   for (const job of jobs) {
     const row = document.createElement('tr');
     for (const value of [time(job.created), job.name || (job.parent === 'diagnostic' ? 'Test receipt' : 'Christmas visitor')]) {
       const cell = document.createElement('td'); cell.textContent = value; row.append(cell);
     }
-    const state = document.createElement('td'), pill = document.createElement('span'); pill.className = 'pill ' + job.state; pill.textContent = job.state; state.append(pill); row.append(state);
+    const state = document.createElement('td'), pill = document.createElement('span'); pill.className = 'pill ' + job.state; pill.textContent = job.state + (job.fallback ? ' · prepared letter' : ''); state.append(pill); row.append(state);
     const message = document.createElement('td'); message.textContent = job.message.slice(0, 90) + (job.message.length > 90 ? '…' : ''); row.append(message);
     const action = document.createElement('td'), button = document.createElement('button'); button.textContent = 'View letter'; button.addEventListener('click', () => openJob(job.id)); action.append(button); row.append(action); $('jobs').append(row);
   }
@@ -93,8 +126,13 @@ function renderJob(job) {
   const buttons = [];
   if (['waiting', 'generating', 'ready'].includes(job.state)) buttons.push(['cancel', 'Cancel letter']);
   if (job.state === 'failed') buttons.push(['retry', job.reply ? 'Retry saved letter' : 'Retry generation']);
-  if (job.state === 'uncertain') buttons.push(['review', 'Mark transmission reviewed']);
+  if (job.state === 'uncertain') buttons.push(['appeared', 'Receipt appeared'], ['missing', 'Missing or partial — reprint'], ['review-cancel', 'Cancel after inspection']);
   if (['sent', 'failed', 'cancelled'].includes(job.state) && job.reply) buttons.push(['reprint', 'Reprint saved receipt']);
+  text('job-timings', `Reference ${job.id.slice(0, 8).toUpperCase()} · Generation attempts ${job.generation_attempts} · Print attempts ${job.send_attempts} · Ready ${time(job.ready_at)} · Sent ${time(job.sent_at)}${job.destination ? ' · Destination ' + job.destination : ''}${job.fallback ? ' · Prepared Santa letter' : ''}`);
+  $('job-events').replaceChildren();
+  for (const entry of job.events || []) { const p = document.createElement('p'); p.textContent = `${time(entry.at)} · ${entry.stage} · ${entry.code}`; $('job-events').append(p); }
+  $('job-links').replaceChildren();
+  for (const id of [job.parent !== 'diagnostic' ? job.parent : null, ...(job.reprints || [])].filter(Boolean)) { const b = document.createElement('button'); b.textContent = 'Linked receipt ' + id.slice(0, 8); b.onclick = () => openJob(id); $('job-links').append(b); }
   for (const [action, label] of buttons) {
     const button = document.createElement('button'); button.className = action === 'reprint' ? 'danger' : 'secondary'; button.textContent = label;
     button.addEventListener('click', () => actOnJob(job, action)); $('job-actions').append(button);
@@ -117,10 +155,12 @@ async function actOnJob(job, action) {
   const descriptions = {
     cancel: 'This stops the job before transmission. A model call already in progress may still finish.',
     retry: job.reply ? 'Render the saved reply and queue it again. No new model call is needed.' : 'Generate a new reply and queue it for printing. This uses the OpenAI API.',
-    review: 'Confirm you have checked the physical printer for a partial or complete receipt. This does not print anything or resume the queue.',
+    appeared: 'Confirm you inspected the printer and found the complete receipt. This marks it sent and does not resume printing.',
+    missing: 'Confirm you inspected the printer. This records the missing or partial receipt and queues one exact replacement. Printing remains paused until you resume it.',
+    'review-cancel': 'Confirm you inspected the printer and want to cancel this letter without printing a replacement.',
     reprint: 'Print another copy of this exact saved receipt. Check that a duplicate is wanted before confirming.'
   };
-  if (!await confirmAction(action === 'reprint' ? 'Reprint this receipt?' : 'Confirm ' + action, descriptions[action], action === 'reprint' ? '/admin/api/jobs/' + job.id + '/preview' : null)) return;
+  if (!await confirmAction(action === 'reprint' ? 'Reprint this receipt?' : 'Confirm ' + action, descriptions[action], ['reprint', 'missing'].includes(action) ? '/admin/api/jobs/' + job.id + '/preview' : null)) return;
   const buttons = [...$('job-actions').querySelectorAll('button')]; buttons.forEach(b => { b.disabled = true; });
   try { const updated = await api('jobs/' + job.id + '/' + action, 'POST'); selectedJob = updated; renderJob(updated); await refresh(); notice('Action recorded.'); }
   catch (error) { text('job-action-error', error.message); $('job-action-error').hidden = false; }
@@ -133,7 +173,7 @@ const fields = [
   ['browser_cooldown', 'Per-browser cooldown (seconds)', 'number', 0, 3600], ['global_per_minute', 'Letters per minute, globally', 'number', 1, 1000],
   ['ip_per_minute', 'Default submissions per IP / minute', 'number', 1, 1000], ['ip_per_day', 'Default submissions per IP / 24 hours', 'number', 1, 10000],
   ['queue_limit', 'Maximum outstanding jobs', 'number', 1, 500], ['failed_codes_per_ip', 'Failed codes per IP / five minutes', 'number', 1, 100],
-  ['retention_hours', 'Letter retention (hours)', 'number', 1, 168], ['cut', 'Cut paper after each receipt', 'checkbox']
+  ['retention_hours', 'Letter retention (hours)', 'number', 1, 168], ['fallback_enabled', 'Use prepared letters when AI fails', 'checkbox'], ['cut', 'Cut paper after each receipt', 'checkbox']
 ];
 function renderSettings(settings) {
   $('settings-fields').replaceChildren();
@@ -185,7 +225,11 @@ $('print-test').onclick = async () => {
   catch (error) { notice(error.message, true); }
   finally { $('print-test').disabled = false; }
 };
-$('filter').onchange = () => loadJobs().catch(error => notice(error.message, true));
+$('filter').onchange = () => { queuePage = 1; loadJobs().catch(error => notice(error.message, true)); };
+let searchTimer;
+$('queue-search').oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { queuePage = 1; loadJobs().catch(e => notice(e.message, true)); }, 250); };
+$('queue-prev').onclick = () => { queuePage = Math.max(1, queuePage - 1); loadJobs().catch(e => notice(e.message, true)); };
+$('queue-next').onclick = () => { queuePage++; loadJobs().catch(e => notice(e.message, true)); };
 $('close-dialog').onclick = () => $('job-dialog').close();
 for (const tab of document.querySelectorAll('[data-tab]')) {
   tab.addEventListener('click', async () => {
@@ -208,7 +252,7 @@ for (const tab of document.querySelectorAll('[data-tab]')) {
 async function refresh() {
   if (loading) return; loading = true;
   try {
-    renderOverview(await api('overview'));
+    renderOverview(await api('overview')); $('admin-connection').hidden = true;
     if (currentTab === 'queue') await loadJobs();
     if (currentTab === 'ip') await loadIPs();
     await loadHistory();
@@ -216,7 +260,7 @@ async function refresh() {
       const updated = await api('jobs/' + selectedJob.id);
       if (updated.updated !== selectedJob.updated || updated.state !== selectedJob.state) { selectedJob = updated; renderJob(updated); }
     }
-  } catch (error) { notice(error.message, true); }
+  } catch (error) { text('admin-connection', 'Dashboard disconnected. Last values may be stale. ' + error.message); $('admin-connection').hidden = false; notice(error.message, true); }
   finally { loading = false; }
 }
 refresh(); setInterval(refresh, 5000); setInterval(updateCountdowns, 1000);
@@ -266,4 +310,39 @@ $('ip-rule-form').onsubmit = async event => {
       per_day: $('ip-day').value ? Number($('ip-day').value) : null, note: $('ip-note').value.trim() });
     await loadIPs(); notice('IP rule saved.');
   } catch (error) { notice(error.message, true); } finally { event.submitter.disabled = false; }
+};
+
+function addSMSWindow(value = { days: [4, 5, 6], start: '18:00', end: '22:00' }) {
+  const row = document.createElement('div'); row.className = 'sms-window';
+  const days = document.createElement('div'); days.className = 'sms-days';
+  ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].forEach((name, day) => { const label = document.createElement('label'), input = document.createElement('input'); input.type = 'checkbox'; input.value = day; input.checked = value.days.includes(day); label.append(input, document.createTextNode(name)); days.append(label); });
+  row.append(days);
+  for (const key of ['start', 'end']) { const label = document.createElement('label'); label.textContent = key === 'start' ? 'Start' : 'Finish'; const input = document.createElement('input'); input.type = 'time'; input.className = key; input.value = value[key]; input.required = true; label.append(input); row.append(label); }
+  const remove = document.createElement('button'); remove.type = 'button'; remove.textContent = 'Remove hours'; remove.onclick = () => { row.remove(); smsDirty = true; }; row.append(remove); row.onchange = () => { smsDirty = true; }; $('sms-windows').append(row);
+}
+function renderSMSSettings(cfg) { const snapshot = JSON.stringify([cfg.sms_recipients, cfg.sms_schedule]); if (snapshot === smsSnapshot) return; smsSnapshot = snapshot; $('sms-recipients').value = cfg.sms_recipients.join('\n'); $('sms-windows').replaceChildren(); cfg.sms_schedule.forEach(addSMSWindow); }
+$('sms-recipients').oninput = () => { smsDirty = true; };
+$('sms-add-window').onclick = () => { addSMSWindow(); smsDirty = true; };
+$('sms-form').onsubmit = async event => {
+  event.preventDefault(); event.submitter.disabled = true;
+  const windows = [...$('sms-windows').children].map(row => ({ days: [...row.querySelectorAll('input[type=checkbox]:checked')].map(input => Number(input.value)), start: row.querySelector('.start').value, end: row.querySelector('.end').value }));
+  try { await api('settings', 'PATCH', { sms_recipients: $('sms-recipients').value.split(/[\n,]/).map(v => v.trim()).filter(Boolean), sms_schedule: windows }); smsDirty = false; await refresh(); notice('Notification settings saved. Send a test before enabling alerts.'); }
+  catch (error) { notice(error.message, true); } finally { event.submitter.disabled = false; }
+};
+$('sms-test').onclick = async () => {
+  if (smsDirty) { notice('Save notification settings before testing.', true); return; }
+  if (!await confirmAction('Send test messages?', 'This sends one real SMS to each saved recipient using Twilio. Messaging charges may apply.')) return;
+  $('sms-test').disabled = true;
+  try { const result = await api('notifications/test', 'POST'); notice(result.detail); await refresh(); } catch (e) { notice(e.message, true); } finally { $('sms-test').disabled = false; }
+};
+$('sms-enable').onclick = () => toggleSetting('sms_enabled');
+$('logout').onclick = async () => { try { await api('logout', 'POST'); location.assign('/login'); } catch (e) { notice(e.message, true); } };
+$('checklist-run').onclick = async () => {
+  $('checklist-run').disabled = true;
+  try { const result = await api('diagnostics/checklist'); $('checklist-results').replaceChildren(); for (const check of result.checks) { const item = document.createElement('li'); item.textContent = `${check.ok ? '✓' : 'Needs attention:'} ${check.name} — ${check.detail}`; $('checklist-results').append(item); } } catch (e) { notice(e.message, true); } finally { $('checklist-run').disabled = false; }
+};
+$('ai-test').onclick = async () => {
+  if (!await confirmAction('Run paid AI test?', 'This makes one real AI request to verify connectivity. It does not print.')) return;
+  $('ai-test').disabled = true;
+  try { await api('diagnostics/ai-test', 'POST'); await refresh(); notice('AI connection verified.'); } catch (e) { notice(e.message, true); } finally { $('ai-test').disabled = false; }
 };

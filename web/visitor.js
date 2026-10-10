@@ -22,9 +22,13 @@ for (const id of ['name', 'message', 'code']) $(id).addEventListener('input', ()
 });
 $('code').addEventListener('input', () => { $('code').value = $('code').value.replace(/[^0-9]/g, '').slice(0, 4); });
 async function api(url, options = {}) {
-  const response = await fetch(url, { credentials: 'same-origin', ...options });
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 15000);
+  let response;
+  try { response = await fetch(url, { credentials: 'same-origin', ...options, signal: controller.signal }); }
+  catch (failure) { if (failure.name === 'AbortError') throw new TypeError('Connection timed out'); throw failure; }
+  finally { clearTimeout(timer); }
   const body = await response.json();
-  if (!response.ok) throw Object.assign(new Error(body.detail || 'Something went wrong. Please try again.'), { fields: body.fields });
+  if (!response.ok) throw Object.assign(new Error(body.detail || 'Something went wrong. Please try again.'), { fields: body.fields, status: response.status });
   return body;
 }
 async function refreshStatus() {
@@ -37,6 +41,8 @@ async function refreshStatus() {
 }
 function display(job) {
   $('letter-form').hidden = true; $('result').hidden = false;
+  setText('letter-reference', 'Letter reference: ' + job.reference + (job.queue_position ? ' · Position ' + job.queue_position + ' among outstanding letters' : ''));
+  setText('letter-delay', 'Your letter is taking a little longer. Your wish is saved; please keep this page open or ask the event team using your reference.'); $('letter-delay').hidden = !job.delayed;
   setText('job-status', job.label); $('job-status').classList.toggle('in-progress', !terminal.has(job.state));
   error('job-error', job.error);
   if (job.reply) { $('receipt').hidden = false; setText('reply', job.reply); }
@@ -46,7 +52,7 @@ function display(job) {
   }
   $('collect').hidden = job.state !== 'sent';
   $('another').hidden = !terminal.has(job.state);
-  setText('result-heading', job.state === 'sent' ? 'A little magic, just for you.' : 'Your letter is on its way.');
+  setText('result-heading', job.state === 'sent' ? 'A little magic, just for you.' : ['failed', 'uncertain'].includes(job.state) ? 'The event team can help.' : job.state === 'cancelled' ? 'Letter cancelled.' : 'Your letter is on its way.');
 }
 async function poll() {
   if (!activeJob) return;
@@ -54,7 +60,8 @@ async function poll() {
     const job = await api('/api/letters/' + activeJob);
     display(job);
     if (!terminal.has(job.state)) polling = setTimeout(poll, 2000);
-  } catch (_) {
+  } catch (failure) {
+    if (failure.status === 404) { setText('result-heading', 'Letter no longer available.'); setText('letter-reference', 'Letter reference: ' + activeJob.slice(0, 8).toUpperCase()); error('job-error', 'This letter is no longer available. It may have expired. Ask the event team, or write a new letter.'); $('another').hidden = false; setText('job-status', 'Letter no longer available'); return; }
     error('job-error', 'Connection interrupted. We are checking your letter again; please do not resubmit.');
     polling = setTimeout(poll, 4000);
   }

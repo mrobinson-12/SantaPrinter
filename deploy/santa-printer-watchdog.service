@@ -1,0 +1,12 @@
+[Unit]
+Description=Santa Printer independent fault watchdog
+After=santa-printer.service network-online.target
+
+[Service]
+Type=oneshot
+User=santa
+WorkingDirectory=/opt/SantaPrinter
+ExecStart=/opt/SantaPrinter/.venv/bin/python /opt/SantaPrinter/santa_watchdog.py
+TimeoutStartSec=90
+UMask=0077
+NoNewPrivileges=true

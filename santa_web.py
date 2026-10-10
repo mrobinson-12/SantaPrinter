@@ -10,9 +10,9 @@ import re
 import secrets
 from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 import jwt
 from jwt import PyJWKClient
@@ -49,6 +49,25 @@ class Letter(BaseModel):
         return value
 
 
+class ScheduleWindow(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    days: list[int] = Field(min_length=1, max_length=7)
+    start: str = Field(pattern=r'^(?:[01][0-9]|2[0-3]):[0-5][0-9]$')
+    end: str = Field(pattern=r'^(?:[01][0-9]|2[0-3]):[0-5][0-9]$')
+
+    @field_validator('days')
+    @classmethod
+    def weekdays(cls, value):
+        if any(type(day) is not int or not 0 <= day <= 6 for day in value) or len(set(value)) != len(value):
+            raise ValueError('Days must be unique integers, Monday=0 through Sunday=6.')
+        return value
+
+
+class Login(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    password: str = Field(min_length=1, max_length=256)
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     printer_host: str | None = Field(default=None, min_length=1, max_length=253)
@@ -56,6 +75,24 @@ class Settings(BaseModel):
     webhook_url: str | None = Field(default=None, max_length=2048)
     font_size: int | None = Field(default=None, ge=8, le=18)
     cut: bool | None = None
+    fallback_enabled: bool | None = None
+    sms_enabled: bool | None = None
+    sms_recipients: list[str] | None = Field(default=None, max_length=10)
+    sms_schedule: list[ScheduleWindow] | None = Field(default=None, max_length=14)
+
+    @field_validator('sms_recipients')
+    @classmethod
+    def recipients(cls, value):
+        if value is not None and (len(set(value)) != len(value) or any(not re.fullmatch(r'\+[1-9][0-9]{7,14}', v) for v in value)):
+            raise ValueError('Use unique international numbers, such as +61412345678.')
+        return value
+
+    @field_validator('sms_schedule')
+    @classmethod
+    def windows(cls, value):
+        if value and any(w.start == w.end for w in value):
+            raise ValueError('Start and end must differ; split a full day into two windows.')
+        return value
     visitor_title: str | None = Field(default=None, min_length=1, max_length=120)
     visitor_intro: str | None = Field(default=None, min_length=1, max_length=500)
     paused_submissions: bool | None = None
@@ -117,12 +154,14 @@ class Preview(BaseModel):
     text: str = Field(default='Dear friend,\n\nYour Christmas wish has brought a smile to the North Pole. May your holidays be filled with kindness, laughter, and a little magic.\n\nLove, Santa', min_length=1, max_length=600)
 
 
-def public_job(job, files):
+def public_job(job, files, store=None):
     state = job['state']
     labels = {'waiting': 'Received', 'generating': 'Santa is writing', 'ready': 'Waiting for the printer',
               'sending': 'Sending to printer', 'sent': 'Sent to printer', 'failed': 'Unable to complete your letter',
               'uncertain': 'Please check with the event team', 'cancelled': 'Letter cancelled'}
-    return {'id': job['id'], 'state': state, 'label': labels[state], 'reply': job['reply'],
+    return {'reference': job['id'][:8].upper(), 'queue_position': store.queue_position(job) if store else None,
+            'delayed': bool(store and store.clock() - job['created'] > 60 and state in ('waiting','generating','ready')),
+            'id': job['id'], 'state': state, 'label': labels[state], 'reply': job['reply'],
             'preview': '/api/letters/' + job['id'] + '/preview' if (files / (job['id'] + '.png')).exists() else None,
             'error': 'Please ask the event team for help with your letter.' if state in ('failed', 'uncertain') else None}
 
@@ -160,22 +199,32 @@ class AccessVerifier:
             raise HTTPException(401, 'Invalid or expired Cloudflare Access token.') from None
 
 
-def create_app(store=None, service=None, verifier=None, start_background=True):
+def create_app(store=None, service=None, verifier=None, start_background=True, lan=False):
     access = verifier or AccessVerifier()
+    from santa_local_auth import LocalAuth
+    from santa_notifications import NotificationService, credentials_ready, notification_fingerprint
+    local_auth = LocalAuth(store, os.getenv('SANTA_OWNER_PASSWORD_FILE') or str(store.directory / 'owner-password.hash')) if lan and store else None
     data_dir = Path(os.getenv('SANTA_DATA_DIR', str(ROOT / 'runtime'))).expanduser().resolve()
 
     @asynccontextmanager
     async def lifespan(app):
         # Advisory OS lock prevents another process from rotating codes or sending duplicate jobs.
-        app.state.store = store or Store(data_dir)
+        directory = store.directory if store else data_dir
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         lock = None
         if start_background:
-            lock = (app.state.store.directory / 'service.lock').open('a')
+            lock = (directory / 'service.lock').open('a')
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
                 lock.close()
                 raise RuntimeError('Another Santa service is running. Use exactly one process.') from None
+        try:
+            app.state.store = store or Store(data_dir)
+        except BaseException:
+            if lock:
+                lock.close()
+            raise
         app.state.service = service or Service(app.state.store)
         try:
             if start_background:
@@ -190,10 +239,14 @@ def create_app(store=None, service=None, verifier=None, start_background=True):
     app = FastAPI(title='Santa Printer', lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
     def admin(request: Request):
+        if lan:
+            if not local_auth:
+                raise HTTPException(503, 'LAN authentication unavailable.')
+            return local_auth.verify(request.cookies.get('santa_owner', ''))
         return access.verify(request.headers.get('Cf-Access-Jwt-Assertion', ''))
 
     def same_origin(request):
-        configured = os.getenv('PUBLIC_ORIGIN', '').rstrip('/')
+        configured = os.getenv('SANTA_LAN_ORIGIN' if lan else 'PUBLIC_ORIGIN', '').rstrip('/')
         if configured:
             expected = configured
         else:
@@ -207,8 +260,15 @@ def create_app(store=None, service=None, verifier=None, start_background=True):
     async def security(request, call_next):
         is_admin = request.url.path == '/admin' or request.url.path.startswith('/admin/')
         try:
+            if lan and not (request.url.path.startswith('/admin') or request.url.path.startswith('/assets/') or request.url.path in ('/login', '/login/session')):
+                raise HTTPException(404, 'LAN listener is for administration only.')
             if is_admin:
-                request.state.actor = await asyncio.to_thread(admin, request)
+                try:
+                    request.state.actor = await asyncio.to_thread(admin, request)
+                except HTTPException as error:
+                    if lan and request.method == 'GET' and request.url.path.rstrip('/') == '/admin' and error.status_code == 401:
+                        return RedirectResponse('/login', status_code=303)
+                    raise
             # Bound JSON parsing, including chunked requests with no Content-Length.
             if request.method in ('POST', 'PUT', 'PATCH', 'DELETE'):
                 same_origin(request)
@@ -274,12 +334,12 @@ def create_app(store=None, service=None, verifier=None, start_background=True):
         db = request.app.state.store
         job = db.submit(request.state.owner, client_ip(request), letter.idempotency_key,
                         letter.name, letter.message, letter.code)
-        return public_job(job, db.files)
+        return public_job(job, db.files, db)
 
     @app.get('/api/letters/{job_id}')
     def job(job_id: str, request: Request):
         db = request.app.state.store
-        return public_job(db.get_job(job_id, request.state.owner), db.files)
+        return public_job(db.get_job(job_id, request.state.owner), db.files, db)
 
     def image_response(db, job_id):
         path = db.files / (job_id + '.png')
@@ -299,15 +359,18 @@ def create_app(store=None, service=None, verifier=None, start_background=True):
         cfg = db.settings()
         return dict(actor=request.state.actor, metrics=db.metrics(), settings=cfg, codes=db.codes(),
                     printer=request.app.state.service.printer_status, server_time=db.clock(),
-                    model_ready=bool(os.getenv('OPENAI_API_KEY', '').strip()))
+                    model_ready=bool(os.getenv('OPENAI_API_KEY', '').strip()),
+                    health=request.app.state.service.health(), incidents=db.incidents(),
+                    notifications=dict(configured=credentials_ready(), tested=cfg['sms_tested'] and cfg.get('sms_credentials') == notification_fingerprint(cfg), history=NotificationService(db).history()),
+                    lan=lan)
 
     @app.get('/admin/api/jobs')
-    def jobs(request: Request, state: str | None = None):
-        return request.app.state.store.jobs(state)
+    def jobs(request: Request, state: str | None = None, search: str = Query('', max_length=100), page: int = Query(1, ge=1, le=1000000), page_size: int = Query(50, ge=1, le=200)):
+        return request.app.state.store.jobs(state, search, page, page_size)
 
     @app.get('/admin/api/jobs/{job_id}')
     def admin_job(job_id: str, request: Request):
-        return request.app.state.store.get_job(job_id)
+        return request.app.state.store.job_detail(job_id)
 
     @app.get('/admin/api/jobs/{job_id}/preview')
     def admin_preview(job_id: str, request: Request):
@@ -317,10 +380,10 @@ def create_app(store=None, service=None, verifier=None, start_background=True):
 
     @app.post('/admin/api/jobs/{job_id}/{action}')
     def job_action(job_id: str, action: str, request: Request):
-        if action not in ('cancel', 'retry', 'review', 'reprint'):
+        if action not in ('cancel', 'retry', 'review', 'reprint', 'appeared', 'missing', 'review-cancel'):
             raise HTTPException(404)
         db = request.app.state.store
-        return db.get_job(db.action(job_id, action, request.state.actor))
+        return db.job_detail(db.action(job_id, action, request.state.actor))
 
     @app.patch('/admin/api/settings')
     def settings(changes: Settings, request: Request):
@@ -389,14 +452,78 @@ def create_app(store=None, service=None, verifier=None, start_background=True):
         job_id = uuid.uuid4().hex
         with db.transaction() as connection:
             db.capacity_in(connection, cfg)
-            image.save(db.files / (job_id + '.png'), format='PNG')
-            (db.files / (job_id + '.bin')).write_bytes(printer.build_raster_job(image, cut=cfg['cut']))
-            connection.execute('INSERT INTO jobs(id,owner,idem,fingerprint,name,message,state,reply,created,updated,parent,config) '
-                               "VALUES (?,?,?,?,?,?,'ready',?,?,?,?,?)",
+            hashes = db.save_artifacts(job_id, image, printer.build_raster_job(image, cut=cfg['cut']))
+            connection.execute('INSERT INTO jobs(id,owner,idem,fingerprint,name,message,state,reply,created,updated,parent,config,artifact_hash,ready_at,preview_hash) '
+                               "VALUES (?,?,?,?,?,?,'ready',?,?,?,?,?,?,?,?)",
                                (job_id, 'admin', job_id, job_id, '', 'Diagnostic test print', body.text,
-                                db.clock(), db.clock(), 'diagnostic', json.dumps(cfg)))
+                                db.clock(), db.clock(), 'diagnostic', json.dumps(cfg), hashes['artifact_hash'], db.clock(), hashes['preview_hash']))
             db.audit_in(connection, request.state.actor, 'test print', job_id)
         return {'id': job_id, 'state': 'ready'}
+
+    @app.get('/healthz')
+    def healthz(request: Request):
+        # Minimal loopback watchdog signal, no diagnostic or visitor details.
+        peer = request.client.host if request.client else ''
+        if peer not in ('127.0.0.1', '::1', 'testclient'):
+            raise HTTPException(404)
+        health = request.app.state.service.health()
+        healthy = bool(health['workers']) and all(w['healthy'] for w in health['workers'].values())
+        return JSONResponse({'ok': healthy}, status_code=200 if healthy else 503)
+
+    @app.post('/admin/api/incidents/{incident_id}/acknowledge')
+    def acknowledge(incident_id: int, request: Request):
+        request.app.state.store.acknowledge(incident_id, request.state.actor)
+        return {'ok': True}
+
+    @app.post('/admin/api/notifications/test')
+    async def notification_test(request: Request):
+        await asyncio.to_thread(NotificationService(request.app.state.store).test, request.state.actor)
+        return {'ok': True, 'detail': 'Test queued. Enable alerts after every recipient reports delivered.'}
+
+    @app.get('/admin/api/diagnostics/checklist')
+    async def checklist(request: Request):
+        from santa_tools import doctor
+        return await asyncio.to_thread(doctor, request.app.state.store, request.app.state.service, False)
+
+    @app.get('/admin/api/diagnostics/bundle')
+    def bundle(request: Request):
+        from santa_tools import diagnostic_bundle
+        return Response(diagnostic_bundle(request.app.state.store, request.app.state.service), media_type='application/json',
+                        headers={'Content-Disposition': 'attachment; filename="santa-diagnostics.json"'})
+
+    @app.post('/admin/api/diagnostics/ai-test')
+    async def ai_test(request: Request):
+        import santa_reply
+        key = os.getenv('OPENAI_API_KEY', '').strip()
+        if not key:
+            raise HTTPException(409, 'API key is not configured.')
+        try:
+            await asyncio.to_thread(santa_reply.generate_reply, 'Please send a warm Christmas greeting.', key)
+            request.app.state.service.last_ai_success = request.app.state.store.clock()
+        except Exception:
+            raise HTTPException(502, 'AI connectivity test failed. Check configuration and provider status.') from None
+        with request.app.state.store.transaction() as db:
+            request.app.state.store.audit_in(db, request.state.actor, 'paid AI test')
+        return {'ok': True}
+
+    if lan:
+        @app.get('/login')
+        def login_page():
+            return FileResponse(ROOT / 'web' / 'login.html')
+
+        @app.post('/login/session')
+        async def login(body: Login, request: Request):
+            token = await asyncio.to_thread(local_auth.login, request.client.host, body.password)
+            response = JSONResponse({'ok': True})
+            response.set_cookie('santa_owner', token, max_age=8*3600, httponly=True, secure=True, samesite='strict', path='/')
+            return response
+
+        @app.post('/admin/api/logout')
+        def logout(request: Request):
+            local_auth.logout(request.cookies.get('santa_owner', ''))
+            response = JSONResponse({'ok': True})
+            response.delete_cookie('santa_owner', path='/')
+            return response
 
     app.mount('/assets', StaticFiles(directory=ROOT / 'web'), name='assets')
     return app

@@ -16,3 +16,5 @@ santa-preview*.png
 santa-results*
 # Local printer reference manual; not required by the app.
 nt8360-programming-manual.pdf
+santa-backups/
+*.pem

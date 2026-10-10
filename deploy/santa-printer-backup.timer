@@ -1,0 +1,10 @@
+[Unit]
+Description=Back up Santa Printer daily outside display hours
+
+[Timer]
+OnCalendar=*-*-* 05:00:00 Australia/Brisbane
+Persistent=true
+Unit=santa-printer-backup.service
+
+[Install]
+WantedBy=timers.target

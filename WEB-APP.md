@@ -64,11 +64,11 @@ The mobile visitor form accepts an optional first name (60 characters), message 
 
 Codes rotate at five-minute UTC boundaries. Both the current and immediately preceding interval's generated code are valid, independently of webhook delivery. Rotation state survives restarts. Skipped intervals are not delivered retrospectively, and backwards clock changes block acceptance until the clock catches up or is corrected. First-ever startup creates one code; no previous code exists yet. Delivery requires a 2xx response; redirects are rejected. Failures retry after 5, 15, 30, then 60 seconds between attempts, until the code is superseded. The admin panel can resend the current code without changing it.
 
-Queue processing is serial. Jobs snapshot their receipt/printer settings when accepted. Generation is saved before rendering, so a rendering retry can reuse the reply. PNG previews and exact ESC/POS bytes are stored outside the public asset directory. New settings apply to new jobs; reprints use exact saved bytes and the current printer destination.
+Generation uses two bounded workers; physical transmissions remain serial. Jobs snapshot receipt layout settings when accepted and use the current printer destination at transmission. Generation is saved before rendering, so a rendering retry can reuse the reply. PNG previews and exact ESC/POS bytes are stored outside the public asset directory. New settings apply to new jobs; reprints use exact saved bytes and the current printer destination.
 
 The admin overview shows codes, delivery results, printer status, retained counts, and separate controls for pausing submissions and printing. Paused printing still allows queued letters to generate. The queue supports filtering, viewing, cancellation before transmission, explicit retries, and confirmed saved-receipt reprints. Diagnostics include a render-only preview, a confirmed physical test print, delivery history, and an audit trail attributed to the verified administrator email.
 
-A socket failure or restart during transmission marks the job **uncertain** and pauses printing. Check the physical receipt, mark the transmission reviewed, optionally reprint the saved receipt, then resume printing. The server never automatically repeats a potentially partial send. “Sent to printer” means successful transmission, not confirmed physical completion.
+A failure before connecting retries safely; a socket failure or restart during transmission marks the job **uncertain** and pauses printing. Check the physical receipt, choose the physical outcome (appeared, missing/partial and reprint, or cancel), then resume printing. The server never automatically repeats a potentially partial send. “Sent to printer” means successful transmission, not confirmed physical completion.
 
 Letters and previews are purged 24 hours after their last update by default (configurable 1–168 hours). Unfinished/uncertain jobs are preserved until resolved. Diagnostic and audit records expire after seven days. Counts describe retained jobs, not all-time totals. Browser/session and global cooldowns limit abuse; shared event codes are not single-use credentials.
 
@@ -108,3 +108,7 @@ git pull --ff-only
 .venv/bin/python -m pip install -r requirements.txt
 sudo systemctl restart santa-printer
 ```
+
+## Reliability toolkit upgrade
+
+See [OPERATIONS.md](OPERATIONS.md) for the current worker/recovery behavior, Linux upgrade and rollback, LAN owner administration, scheduled Twilio alerts, backups, and event rehearsal. The older single-worker/manual-generation-recovery descriptions above are superseded by this toolkit. Queued jobs retain receipt layout and bytes but use the current printer destination. Interrupted generation resumes automatically, and prepared Santa letters are enabled as the AI-outage fallback. Queue API results now contain `items`, `total`, `page`, and `page_size`.

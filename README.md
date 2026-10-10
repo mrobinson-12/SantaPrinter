@@ -48,3 +48,7 @@ On Windows use `.venv\Scripts\python.exe`. The portable source uses the standard
 ## Mobile web app
 
 A mobile visitor app and Cloudflare Access protected event-team panel are now included. See [WEB-APP.md](WEB-APP.md) for setup, tunnel configuration, background services, queue recovery, and tests. Start with `.venv/bin/python run_web.py` after configuring `.env`. The existing printing commands above remain available.
+
+## Event reliability and recovery
+
+See [OPERATIONS.md](OPERATIONS.md) for Linux deployment, LAN owner access, scheduled SMS alerts, safe queue recovery, backups/restore, and the event rehearsal.

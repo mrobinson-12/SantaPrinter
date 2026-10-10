@@ -204,6 +204,7 @@ def test_generation_render_transmission(db, monkeypatch):
 
 @pytest.mark.parametrize('reply', ['', 'word ' * 61, 'a' * 601])
 def test_bad_model_reply_never_sends(db, monkeypatch, reply):
+    db.update_settings({'fallback_enabled': False}, 'test')
     _, job, _, sends = generate_to_ready(db, monkeypatch, reply)
     assert db.get_job(job['id'])['state'] == 'failed'
     assert sends == []
@@ -211,12 +212,13 @@ def test_bad_model_reply_never_sends(db, monkeypatch, reply):
 
 
 def test_missing_key_and_model_errors_never_send(db, monkeypatch):
+    db.update_settings({'fallback_enabled': False}, 'test')
     monkeypatch.delenv('OPENAI_API_KEY', raising=False)
     sends = []
     service = Service(db, generate=lambda *a: (_ for _ in ()).throw(ValueError('SECRET')), send=lambda *a: sends.append(a))
     job = submit(db)
     service.generate_job(db.claim())
-    assert db.get_job(job['id'])['error'] == 'OPENAI_API_KEY is not configured.'
+    assert db.get_job(job['id'])['error_code'] == 'ai_missing_key'
     monkeypatch.setenv('OPENAI_API_KEY', 'SECRET')
     db.action(job['id'], 'retry', 'admin')
     service.generate_job(db.claim())
@@ -287,7 +289,7 @@ def test_restart_recovery_keeps_untouched_queue(db):
     db.transition(sending['id'], 'waiting', 'sending')
     waiting = submit(db, owner='c')
     db.recover()
-    assert db.get_job(generating['id'])['state'] == 'failed'
+    assert db.get_job(generating['id'])['state'] == 'waiting'
     assert db.get_job(sending['id'])['state'] == 'uncertain'
     assert db.get_job(waiting['id'])['state'] == 'waiting'
     assert db.settings()['paused_printing']

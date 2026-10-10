@@ -149,9 +149,17 @@ def build_raster_job(image, feed=4, cut=True):
     return bytes(job)
 
 
+class ConnectionFailure(OSError):
+    """Connection was not established; no receipt bytes were transmitted."""
+
+
 def send_job(host, port, job, timeout):
     """Send once. Retrying a partial send could print duplicate receipts."""
-    with socket.create_connection((host, port), timeout=timeout) as connection:
+    try:
+        connection = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        raise ConnectionFailure('Printer connection failed before transmission.') from None
+    with connection:
         connection.settimeout(timeout)
         connection.sendall(job)
 

@@ -33,6 +33,7 @@ def main():
     screenshots = ROOT / 'runtime' / 'qa'
     screenshots.mkdir(parents=True, exist_ok=True)
     sends, deliveries, errors = [], [], []
+    probe_status = ['Online']
     with tempfile.TemporaryDirectory() as directory:
         db = Store(directory)
         db.update_settings({'browser_cooldown': 0, 'global_per_minute': 100}, 'test setup')
@@ -46,7 +47,7 @@ def main():
             generate=lambda *args: 'Dear Alex,\n\nYour wish for a telescope has the elves looking up from their wrapping! May your Christmas be filled with starlight, happy discoveries, and a little North Pole magic.\n\nLove, Santa',
             send=send,
             webhook=lambda url, code: (deliveries.append({'code': code}) or True, 'HTTP 200'),
-            probe=lambda *args: {'status': 'Online', 'checked': True})
+            probe=lambda *args: {'status': probe_status[0], 'checked': True})
         with socket.socket() as listener:
             listener.bind(('127.0.0.1', 0))
             port = listener.getsockname()[1]
@@ -97,6 +98,7 @@ def main():
                 page.locator('#submit').click()
                 expect(page.locator('#job-status')).to_have_text('Sent to printer', timeout=15000)
                 expect(page.locator('#reply')).to_contain_text('telescope')
+                expect(page.locator('#letter-reference')).to_contain_text('Letter reference:')
                 expect(page.locator('#preview')).to_be_visible()
                 assert len(sends) == 1
                 job_id = page.evaluate("JSON.parse(sessionStorage.getItem('santa-draft-v1')).activeJob")
@@ -132,6 +134,11 @@ def main():
                 expect(admin.locator('#pause-submissions')).to_have_text('Pause submissions')
                 admin.locator('#tab-queue').click()
                 expect(admin.locator('#jobs button')).to_have_count(1)
+                admin.locator('#queue-search').fill('no-such-visitor')
+                expect(admin.locator('#jobs button')).to_have_count(0)
+                admin.locator('#queue-search').fill(job_id[:8])
+                expect(admin.locator('#jobs button')).to_have_count(1)
+                admin.locator('#queue-search').fill('')
                 admin.locator('#jobs button').click()
                 expect(admin.locator('#job-dialog')).to_be_visible()
                 admin.get_by_role('button', name='Reprint saved receipt', exact=True).click()
@@ -153,6 +160,19 @@ def main():
                 expect(admin.locator('#admin-status')).to_have_text('Settings saved.')
                 assert db.settings()['retention_hours'] == 48
                 admin.locator('#tab-diagnostics').click()
+                admin.locator('#checklist-run').click()
+                expect(admin.locator('#checklist-results')).to_contain_text('Database')
+                bundle = team.request.get(base + '/admin/api/diagnostics/bundle')
+                assert bundle.status == 200 and bundle.json()['format'] == 1
+                assert 'telescope' not in bundle.text() and 'Alex' not in bundle.text()
+                admin.locator('#sms-add-window').click()
+                expect(admin.locator('.sms-window')).to_have_count(1)
+                expect(admin.locator('#sms-state')).to_contain_text('not configured')
+                for width in (320, 375, 430, 1280):
+                    admin.set_viewport_size({'width': width, 'height': 900})
+                    assert admin.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), ('diagnostics', width)
+                admin.set_viewport_size({'width': 375, 'height': 900})
+                admin.screenshot(path=str(screenshots / 'admin-diagnostics-mobile.png'), full_page=True)
                 admin.locator('#render-test').click()
                 expect(admin.locator('#diagnostic-preview')).to_be_visible()
                 assert len(sends) == 2
@@ -161,15 +181,28 @@ def main():
                 admin.locator('#confirm-yes').click()
                 expect(admin.locator('#job-meta')).to_contain_text('uncertain', timeout=15000)
                 assert db.settings()['paused_printing']
-                admin.get_by_role('button', name='Mark transmission reviewed').click()
+                admin.get_by_role('button', name='Cancel after inspection').click()
                 admin.locator('#confirm-yes').click()
-                expect(admin.locator('#job-meta')).to_contain_text('failed')
+                expect(admin.locator('#job-meta')).to_contain_text('cancelled')
                 admin.locator('#close-dialog').click()
                 admin.locator('#tab-overview').click()
                 expect(admin.locator('#pause-printing')).to_have_text('Resume printing')
                 admin.locator('#pause-printing').click()
                 expect(admin.locator('#pause-printing')).to_have_text('Pause printing')
                 assert not db.settings()['paused_printing']
+                probe_status[0] = 'Cover open'
+                admin.locator('#check-printer').click()
+                expect(admin.locator('#printer-status')).to_have_text('Cover open')
+                assert service.hardware_hold and not db.settings()['paused_printing']
+                expect(admin.locator('#incidents')).to_contain_text('Printer unavailable')
+                probe_status[0] = 'Online'
+                admin.locator('#check-printer').click()
+                expect(admin.locator('#printer-status')).to_have_text('Online')
+                admin.locator('#check-printer').click()
+                deadline = time.time() + 5
+                while service.hardware_hold and time.time() < deadline:
+                    time.sleep(.05)
+                assert not service.hardware_hold
                 admin.locator('#tab-ip').click()
                 expect(admin.locator('#ip-default-minute')).to_have_value('5')
                 expect(admin.locator('#ip-default-day')).to_have_value('10')
@@ -197,9 +230,14 @@ def main():
                 expect(admin.locator('#ip-rows')).to_contain_text('Default')
                 assert db.ip_controls()['addresses'][0]['effective_minute'] == 4
                 admin.screenshot(path=str(screenshots / 'admin-ip-controls.png'), full_page=True)
+                page.evaluate("sessionStorage.setItem('santa-draft-v1', JSON.stringify({activeJob: 'ffffffffffffffffffffffffffffffff'}))")
+                page.reload()
+                expect(page.locator('#job-status')).to_have_text('Letter no longer available')
+                expect(page.locator('#job-error')).to_contain_text('may have expired')
+                expect(page.locator('#another')).to_be_visible()
                 assert deliveries and set(deliveries[0]) == {'code'}
                 assert errors == [], errors
-                print('Browser acceptance passed: mobile/desktop layouts, draft recovery, code gate, ownership, automatic printing, admin controls, exact reprint, diagnostics, and uncertain-send review.')
+                print('Browser acceptance passed: mobile/desktop layouts, draft recovery, code gate, ownership, automatic printing, admin controls, exact reprint, diagnostics, guided uncertain-send recovery, queue search, checklist, hardware holds, and expired-letter recovery.')
                 browser.close()
         finally:
             server.should_exit = True

@@ -1,0 +1,9 @@
+[Unit]
+Description=Consistent Santa Printer overnight backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/SantaPrinter
+ExecStart=/bin/sh /opt/SantaPrinter/deploy/backup-runtime.sh /opt/SantaPrinter santa /opt/santa-backups
+TimeoutStartSec=180
+UMask=0077

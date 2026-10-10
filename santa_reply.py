@@ -70,6 +70,12 @@ def extract_reply(response, enforce_limits=True):
     return reply
 
 
+class GenerationError(ValueError):
+    def __init__(self, code, retryable=False):
+        self.code, self.retryable = code, retryable
+        super().__init__('Santa generation failed: ' + code)
+
+
 def generate_reply(message, key, timeout=45, enforce_limits=True):
     payload = {
         "model": MODEL,
@@ -88,15 +94,12 @@ def generate_reply(message, key, timeout=45, enforce_limits=True):
         with urllib.request.urlopen(request, timeout=timeout) as result:
             response = json.load(result)
     except urllib.error.HTTPError as error:
-        try:
-            detail = json.loads(error.read()).get("error", {}).get("message", "Request failed")
-        except (ValueError, AttributeError):
-            detail = "Request failed"
-        raise ValueError("OpenAI API error {}: {}. Nothing printed.".format(error.code, detail)) from None
-    except (urllib.error.URLError, TimeoutError) as error:
-        raise ValueError("OpenAI API connection failed; nothing printed. No automatic retry.") from error
+        code = 'authentication' if error.code in (401, 403) else 'rate_limit' if error.code == 429 else 'upstream_error'
+        raise GenerationError(code, error.code == 429 or error.code >= 500) from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise GenerationError('connection', True) from None
     except json.JSONDecodeError:
-        raise ValueError("Invalid API response; nothing printed.") from None
+        raise GenerationError('invalid_response') from None
     if not enforce_limits and response.get("status") != "completed":
         print("Warning: API response is incomplete; showing available text.", file=sys.stderr)
     return extract_reply(response, enforce_limits=enforce_limits)
